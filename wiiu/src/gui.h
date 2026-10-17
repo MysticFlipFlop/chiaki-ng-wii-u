@@ -14,11 +14,15 @@
 // Triada de buffers de vertices: cada flush escribe un buffer
 // distinto para no pisar lo que el GPU todavia lee del frame anterior.
 
-// Color RGBA en memoria (atributo UNORM_8_8_8_8): byte0=R,1=G,2=B,3=A
-// (little-endian => 0xAABBGGRR).
+// Color RGBA en memoria (atributo UNORM_8_8_8_8): GX2 toma los cuatro
+// bytes en orden de direccion como (R,G,B,A) y la CPU es big-endian,
+// asi que el u32 va como 0xRRGGBBAA (memoria [R][G][B][A]). Con la
+// codificacion little-endian los canales llegaban rotados: el alfa
+// caia en el canal R (lo azul salia invisible: a=0 => alfa 0) y el
+// 0xff de alfa caia en R (los grises #121212 se teñian de rojo vino).
 #define GUI_RGBA(r, g, b, a)                                                    \
-	((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16) |      \
-	 ((uint32_t)(a) << 24))
+	(((uint32_t)(r) << 24) | ((uint32_t)(g) << 16) |                      \
+	 ((uint32_t)(b) << 8) | ((uint32_t)(a)))
 
 // Carga shaders (VS reutilizado del GFD de video + PS gui_gsh), fuente
 // y buffers. Llamar una vez tras inicializar el log; si falla el menu

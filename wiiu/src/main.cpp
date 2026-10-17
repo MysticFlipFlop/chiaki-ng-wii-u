@@ -18,6 +18,7 @@
  *   Y = borrar IP y volver a broadcast 255.255.255.255
  *   ↑ = registrar consola (ID PSN + PIN de "Enlazar con otro dispositivo")
  *   SELECT = editar el Account ID de PSN en cualquier momento
+ *   ↓ = Ajustes (ID PSN, IP, calidad de video, eliminar consola)
  *   A = conectar Remote Play (despierta la PS4 si esta en standby)
  *   B = durante la conexion de la sesion, cancela. Con stream activo
  *       (fase 3c) el mando va al juego: layout por posicion fisica
@@ -105,6 +106,21 @@ static volatile bool g_config_dirty = false;
 // Consola resaltada en el menu (indice en g_config.consoles); la
 // navegan Izq/Dcha y la aplica apply_console() a los globals de sesion.
 static int g_menu_sel = 0;
+// Fase 4c: pantalla de Ajustes (Abajo) con filas tocables en el DRC.
+// Mismos flujos que las teclas del menu: cuenta = SELECT, IP = X,
+// calidad = ZL/ZR (solo dentro de Ajustes); eliminar consola abre el
+// dialogo de confirmacion — el borrado vive unicamente aqui, sin
+// atajo PLUS en la lista principal.
+enum {
+	SET_ROW_ACCOUNT = 0,
+	SET_ROW_IP,
+	SET_ROW_QUALITY,
+	SET_ROW_DELETE,
+	SET_ROWS,
+};
+static bool g_settings_open = false;
+static int g_set_sel = 0;
+static bool g_set_touch_prev = false;
 static char g_regist_target_host[CONFIG_HOST_SIZE]; // host del regist en curso
 
 // Dialogo modal de confirmacion de borrado (PLUS en la toolbar): sin
@@ -959,6 +975,10 @@ static bool sd_write_file(const char *path, const char *buf, size_t len)
 static char g_cfg_in[4096] __attribute__((aligned(64)));
 static char g_cfg_out[2048] __attribute__((aligned(64)));
 
+// Para el log de carga (definidas mas abajo con la tabla de presets).
+static int video_preset_cur(void);
+static const char *video_preset_label(int idx);
+
 // Aplica la consola idx a los globals de sesion (IP + claves + nombre)
 // y la marca como seleccionada en el menu. Asi A conecta siempre con la
 // consola resaltada, igual al arranque o al cambiar con Izq/Dcha.
@@ -991,6 +1011,10 @@ static void config_load_sd(void)
 	logprintf("Config: %d consola(s) guardadas, account_id=%s", count,
 		  g_config.account_id_hex[0] ? g_config.account_id_hex
 					     : "(ninguna)");
+	// El preset se persiste desde gui-44 (video_preset= en el ini);
+	// el log lo hace visible al arrancar.
+	logprintf("Config: video_preset=%d (%s)", g_config.video_preset,
+		  video_preset_label(video_preset_cur()));
 
 	// Preseleccionar la ultima consola (o la primera): IP + claves +
 	// cuenta => A conecta sin repetir registro ni teclados.
@@ -1618,7 +1642,7 @@ static void refuse_a_empty_list(void)
 {
 	logprintf("A: lista de consolas vacia — Arriba para registrar");
 	snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-		 "Sin consolas registradas - pulsa Arriba con el PIN");
+		 "Sin consolas registradas - pulsa ↑ con el PIN");
 }
 
 static void handle_press_a()
@@ -1960,7 +1984,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-49"
+#define APP_BUILD_TAG "gui-56"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2098,9 +2122,92 @@ static void draw_touchpad(int w, int h)
 	uint32_t col = g_tp_down ? GUI_RGBA(0x94, 0x94, 0x94, 0)
 				 : GUI_RGBA(0x3d, 0x3d, 0x3d, 0);
 	uint32_t a = (uint32_t)((g_tp_down ? 0xbf : 0x99) * fade + 0.5f);
+	// (Con la codificacion BE de GUI_RGBA el alfa va en el byte bajo:
+	// col lleva a=0 y el fundido se OR-ea encima.)
 	gui_image((float)x, (float)y, (float)rw, (float)rh, tu, tv, tw, th,
-		  col | (a << 24));
+		  col | a);
 	gui_flush();
+}
+
+// Geometria de las filas de Ajustes: lista bajo el titulo, filas tipo
+// ItemDelegate (u*7, como la lista de consolas). Compartida por el
+// dibujo (TV y DRC) y el hit-test tactil del DRC (854x480).
+static void settings_row_geom(int w, int *list_y, int *row_h)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	*list_y = (u * 3 + u / 2) + u * 6; // barra + titulo
+	*row_h = u * 7;
+}
+
+// Cicla el perfil de calidad (fase 4c) en la direccion dada: ZL/ZR y
+// la fila de Ajustes lo usan. Solo fuera de sesion: el perfil se
+// negocia al abrir el stream, asi que aplica al reconectar.
+static void settings_cycle_quality(int dir)
+{
+	if(g_session_active)
+	{
+		logprintf("Calidad: en sesion (B para parar)");
+		return;
+	}
+	g_config.video_preset =
+		(video_preset_cur() + dir + VIDEO_PRESET_COUNT) %
+		VIDEO_PRESET_COUNT;
+	g_config_dirty = true;
+	logprintf("Calidad: %s (aplica al reconectar)",
+		  video_preset_label(g_config.video_preset));
+}
+
+// Accion de una fila de Ajustes (A o toque en el DRC).
+static void settings_activate(int row)
+{
+	if(row == SET_ROW_ACCOUNT)
+	{
+		// Mismo flujo que SELECT: editable en cualquier momento;
+		// el teclado valida el base64.
+		if(g_session_active)
+			logprintf("Ajustes: en sesion (B para parar)");
+		else if(g_regist_state != RegistState::Idle)
+			logprintf("Ajustes: regist en curso — espera a que termine");
+		else
+		{
+			logprintf("Ajustes: editar Account ID de PSN");
+			g_accountid_regist_flow = false;
+			swkbd_show(Prompt::AccountId);
+		}
+	}
+	else if(row == SET_ROW_IP)
+	{
+		// Igual que X: el teclado fija la IP de la consola.
+		logprintf("Ajustes: abrir teclado para IP de la consola");
+		swkbd_show(Prompt::IP);
+	}
+	else if(row == SET_ROW_QUALITY)
+		settings_cycle_quality(1);
+	else if(row == SET_ROW_DELETE)
+	{
+		// Ultima fila de Ajustes: mismo flujo que PLUS. Cierra
+		// Ajustes (el dialogo se dibuja sobre la lista) y abre
+		// la confirmacion — B vuelve, A elimina.
+		int cnt = config_console_count(&g_config);
+		if(g_session_active)
+			logprintf("Ajustes: en sesion (B para parar)");
+		else if(g_regist_state != RegistState::Idle)
+			logprintf("Ajustes: regist en curso — espera a que termine");
+		else if(cnt <= 0)
+			logprintf("Ajustes: no hay consolas registradas");
+		else
+		{
+			if(g_menu_sel < 0 || g_menu_sel >= cnt)
+				g_menu_sel = 0;
+			g_settings_open = false;
+			g_set_touch_prev = false;
+			g_confirm_del = true;
+			logprintf(
+				"Ajustes: eliminar consola %d/%d — dialogo abierto (A/B)",
+				g_menu_sel + 1, cnt);
+		}
+	}
 }
 
 static void draw_menu(int w, int h)
@@ -2150,27 +2257,142 @@ static void draw_menu(int w, int h)
 	gui_image((float)m, ((float)bar_h - logo_h) / 2.f, logo_w, logo_h,
 		  lu, lv, lw, lh, c_white);
 
+	// Fase 4c: pantalla de Ajustes — su propia lista de filas
+	// tocables; la toolbar se oculta (como con el dialogo de
+	// borrado) para no amontonar la DRC.
+	if(g_settings_open)
+	{
+		int list_y, row_h;
+		settings_row_geom(w, &list_y, &row_h);
+
+		gui_text((float)m, (float)(bar_h + u * 2), "Ajustes",
+			 c_text, scale * 2);
+
+		for(int i = 0; i < SET_ROWS; i++)
+		{
+			int y = list_y + i * row_h;
+			// Feedback de seleccion sin tocar la legibilidad:
+			// tinte fuerte + barra ancha + chevron a la derecha
+			// de la fila activa (el texto siempre blanco).
+			bool is_sel = (i == g_set_sel);
+			if(is_sel)
+			{
+				gui_rect(0.f, (float)y, (float)w,
+					 (float)row_h,
+					 GUI_RGBA(0x00, 0xa7, 0xff, 0x59));
+				gui_rect(0.f, (float)y, (float)(u / 2),
+					 (float)row_h, c_accent);
+			}
+
+			const char *label;
+			char value[48];
+			uint32_t vc = c_text2;
+			if(i == SET_ROW_ACCOUNT)
+			{
+				label = "ID PSN";
+				uint8_t id[CHIAKI_PSN_ACCOUNT_ID_SIZE];
+				char b64[13] = { 0 };
+				if(g_config.account_id_hex[0] &&
+				   parse_psn_account_id(g_config.account_id_hex,
+						       id) &&
+				   chiaki_base64_encode(id, sizeof(id), b64,
+							 sizeof(b64)) ==
+					       CHIAKI_ERR_SUCCESS)
+				{
+					// En base64, el mismo formato en
+					// que se teclea (wLEMeFoyimY=).
+					snprintf(value, sizeof(value), "%s",
+						 b64);
+				}
+				else
+				{
+					snprintf(value, sizeof(value),
+						 "sin definir");
+					vc = c_text3;
+				}
+			}
+			else if(i == SET_ROW_IP)
+			{
+				label = "IP de la PS4";
+				if(g_host_ip[0])
+					snprintf(value, sizeof(value), "%s",
+						 g_host_ip);
+				else
+				{
+					snprintf(value, sizeof(value),
+						 "sin fijar");
+					vc = c_text3;
+				}
+			}
+			else if(i == SET_ROW_QUALITY)
+			{
+				label = "Calidad de video";
+				snprintf(value, sizeof(value), "%s",
+					 video_preset_label(
+						 video_preset_cur()));
+			}
+			else
+			{
+				// Ultima fila: elimina la consola
+				// seleccionada en la lista (mismo
+				// dialogo de confirmacion que PLUS).
+				label = "Eliminar consola";
+				int cnt = config_console_count(&g_config);
+				if(cnt > 0)
+				{
+					int psel = (g_menu_sel >= 0 &&
+						    g_menu_sel < cnt)
+							   ? g_menu_sel
+							   : 0;
+					const ConfigConsole *pc =
+						&g_config.consoles[psel];
+					snprintf(value, sizeof(value), "%s",
+						 pc->name[0] ? pc->name
+								      : "?");
+				}
+				else
+				{
+					snprintf(value, sizeof(value),
+						 "sin consolas");
+					vc = c_text3;
+				}
+			}
+
+			int ty = y + (row_h - u) / 2;
+			gui_text((float)(m + u), (float)ty, label, c_text,
+				 scale);
+			// Valor a la derecha con hueco fijo para el
+			// chevron de la fila activa (sin salto de texto).
+			gui_text((float)(w - m - u * 2) -
+					 gui_text_width(value, scale),
+				 (float)ty, value, vc, scale);
+			if(is_sel)
+				gui_text((float)(w - m - u), (float)ty, ">",
+					 c_accent, scale);
+		}
+
+		const char *hint =
+			"↑/↓: elegir   A o tocar: abrir   B: volver";
+		gui_text(((float)w - gui_text_width(hint, scale)) / 2.f,
+			 (float)(h - u * 2), hint, c_text3, scale);
+		gui_flush();
+		return;
+	}
+
 	// Botones planos del ToolBar (chiaki-ng) con chips de boton del
-	// gamepad para los que tienen tecla propia (SELECT, X, Y); HOME
-	// y las flechas del D-pad van en texto.
+	// gamepad para los que tienen tecla propia (SELECT, X, Y); el
+	// registro (Arriba) va en texto. Sin "Salir (HOME)": en Wii U
+	// se sale con HOME, y Calidad/Eliminar pasaron a Ajustes (4c).
 	struct TbSeg
 	{
 		char chip;
 		const char *label;
 	};
-	// Segmento "Calidad" con el preset vigente a la vista (ZL/ZR lo
-	// cicla; label dinámico, por eso el array no es const).
-	char quality_lbl[40];
-	snprintf(quality_lbl, sizeof(quality_lbl), "Calidad %s",
-		 video_preset_label(video_preset_cur()));
 	const TbSeg tb_segs[] = {
-		{ 0, "Registrar (Arriba)" },
+		{ 0, "Registrar (↑)" },
 		{ '-', "ID" },
 		{ 'X', "IP" },
 		{ 'Y', "Buscar" },
-		{ 'Z', quality_lbl },
-		{ '+', "Eliminar" },
-		{ 0, "Salir (HOME)" },
 	};
 	int nseg = (int)(sizeof(tb_segs) / sizeof(tb_segs[0]));
 	float chip_d = (float)(scale * 12);
@@ -2189,9 +2411,8 @@ static void draw_menu(int w, int h)
 	}
 	float ty = ((float)bar_h - (float)u) / 2.f;
 	float tx = (float)(w - m) - total;
-	// Con el dialogo de borrado abierto la toolbar se oculta: su
-	// etiqueta "Eliminar" (chip +) quedaba fuera del cuadro de
-	// confirmacion y se confundia con la accion del dialogo.
+	// Con el dialogo de borrado abierto la toolbar se oculta: el
+	// modal manda y no debe competir con sus atajos.
 	if(!g_confirm_del)
 	{
 		for(int i = 0; i < nseg; i++)
@@ -2244,7 +2465,7 @@ static void draw_menu(int w, int h)
 		{
 			// Aviso unico y directo: detectada -> ↑ registra.
 			const char *msg =
-				"Consola detectada - pulsa Arriba para registrar";
+				"Consola detectada - pulsa ↑ para registrar";
 			gui_text(((float)w - gui_text_width(msg, scale)) / 2.f,
 				 (float)(list_y + u * 8), msg, c_text2,
 				 scale);
@@ -2252,7 +2473,7 @@ static void draw_menu(int w, int h)
 		else
 		{
 			const char *empty =
-				"Sin consolas registradas - pulsa Arriba con el PIN de la PS4";
+				"Sin consolas registradas - pulsa ↑ con el PIN de la PS4";
 			gui_text(((float)w - gui_text_width(empty, scale)) / 2.f,
 				 (float)(list_y + u * 8), empty, c_text3,
 				 scale);
@@ -2373,8 +2594,8 @@ static void draw_menu(int w, int h)
 	const char *foot = g_regist_state != RegistState::Idle
 				   ? "Registrando... introduce el PIN que muestra la PS4"
 				   : (count <= 0
-					      ? "Arriba: registrar con el PIN de la PS4"
-					      : "Izq/Dcha: elegir consola");
+					      ? "↑: registrar con el PIN de la PS4"
+					      : "←/→: elegir consola");
 	gui_text((float)m, (float)(h - m - u), foot, c_text2, scale);
 	if(g_last_session_msg[0])
 		gui_text((float)m, (float)(h - m - u * 2), g_last_session_msg,
@@ -2382,11 +2603,11 @@ static void draw_menu(int w, int h)
 	gui_text((float)(w - m) - gui_text_width(APP_BUILD_TAG, scale),
 		 (float)(h - m - u), APP_BUILD_TAG, c_text3, scale);
 
-	// Dialogo modal de confirmacion de borrado (PLUS en la toolbar):
-	// scrim + carta Material centrada; fila inferior con [B] volver y
-	// [A] Eliminar lado a lado (sin navegacion ni Cancelar: eso es B).
-	// La toolbar se oculta mientras este abierto (su "Eliminar" del
-	// chip + quedaba fuera del cuadro).
+	// Dialogo modal de confirmacion de borrado (solo desde la fila
+	// "Eliminar consola" de Ajustes): scrim + carta Material
+	// centrada; fila inferior con [B] volver y [A] Eliminar lado a
+	// lado (sin navegacion ni Cancelar: eso es B). La toolbar se
+	// oculta mientras el modal este abierto.
 	if(g_confirm_del && count > 0)
 	{
 		gui_rect(0.f, 0.f, (float)w, (float)h,
@@ -2509,7 +2730,7 @@ int main(int argc, char **argv)
 	// el resto de la app sigue funcionando (las primitivas son no-op).
 	logprintf("init: gui %s", gui_init() ? "ok" : "FALLO");
 
-	logprintf("Controles: A=conectar  Izq/Dcha=elegir consola  Arriba=registrar  SELECT=ID  X=IP  Y=broadcast  ZL/ZR=calidad  icono abajo dcha (tocar)=parar sesion");
+	logprintf("Controles: A=conectar  Izq/Dcha=elegir consola  Arriba=registrar  Abajo=ajustes  SELECT=ID  X=IP  Y=broadcast  ZL/ZR=calidad (en Ajustes)  icono abajo dcha (tocar)=parar sesion");
 
 	uint32_t last_hold = 0;
 	VPADTouchData last_touch = {};
@@ -2612,28 +2833,44 @@ int main(int argc, char **argv)
 						g_confirm_del = false;
 					}
 				}
-				else if(rising & VPAD_BUTTON_PLUS)
+				else if(g_settings_open)
 				{
-					// PLUS: borrado de la consola
-					// seleccionada, con confirmacion.
-					int count = config_console_count(
-						&g_config);
-					if(g_session_active)
-						logprintf("PLUS: en sesion (B para parar)");
-					else if(g_regist_state !=
-						RegistState::Idle)
-						logprintf("PLUS: regist en curso — espera a que termine");
-					else if(count <= 0)
-						logprintf("PLUS: no hay consolas registradas");
-					else
+					// Fase 4c: en Ajustes las teclas del
+					// menu quedan consumidas; B cierra.
+					if(rising & VPAD_BUTTON_B)
 					{
-						if(g_menu_sel < 0 ||
-						   g_menu_sel >= count)
-							g_menu_sel = 0;
-						g_confirm_del = true;
-						logprintf(
-							"PLUS: eliminar consola %d/%d — dialogo abierto (A/B)",
-							g_menu_sel + 1, count);
+						g_settings_open = false;
+						g_set_touch_prev = false;
+						logprintf("Ajustes: cerrados");
+					}
+					else if(rising & VPAD_BUTTON_DOWN)
+						g_set_sel = (g_set_sel + 1) %
+							     SET_ROWS;
+					else if(rising & VPAD_BUTTON_UP)
+						g_set_sel = (g_set_sel +
+							      SET_ROWS - 1) %
+							     SET_ROWS;
+					else if(rising & VPAD_BUTTON_A)
+						settings_activate(g_set_sel);
+					// ZL/ZR: atajo de calidad —
+					// solo dentro de Ajustes.
+					else if(rising &
+						(VPAD_BUTTON_ZL |
+						 VPAD_BUTTON_ZR))
+						settings_cycle_quality(
+							(rising & VPAD_BUTTON_ZR)
+								? 1
+								: -1);
+					else if(rising &
+						(VPAD_BUTTON_LEFT |
+						 VPAD_BUTTON_RIGHT))
+					{
+						if(g_set_sel ==
+						   SET_ROW_QUALITY)
+							settings_cycle_quality(
+								(rising & VPAD_BUTTON_RIGHT)
+									? 1
+									: -1);
 					}
 				}
 				else if(rising & VPAD_BUTTON_X)
@@ -2734,34 +2971,55 @@ int main(int argc, char **argv)
 				else if(rising & (VPAD_BUTTON_ZL |
 						  VPAD_BUTTON_ZR))
 				{
-					// ZL/ZR: perfil de calidad (fase
-					// 4c). Solo fuera de sesion: se
-					// aplica al reconectar (el perfil
-					// se negocia al abrir stream).
+					// En la lista principal el preset
+					// no se toca: la calidad solo se
+					// cambia en Ajustes (Abajo).
+					logprintf(
+						"ZL/ZR: la calidad se cambia en Ajustes (Abajo)");
+				}
+				else if(rising & VPAD_BUTTON_DOWN)
+				{
+					// Abajo: pantalla de Ajustes (fase
+					// 4c). Solo fuera de sesion: durante
+					// la conexion B debe seguir parando.
 					if(g_session_active)
 						logprintf(
-							"ZL/ZR: en sesion (B para parar)");
+							"Abajo: en sesion (B para parar)");
 					else
 					{
-						int cur =
-							video_preset_cur();
-						int dir = (rising &
-							   VPAD_BUTTON_ZR)
-								 ? 1
-								 : -1;
-						g_config.video_preset =
-							(cur + dir +
-							 VIDEO_PRESET_COUNT) %
-							VIDEO_PRESET_COUNT;
-						g_config_dirty = true;
+						g_settings_open = true;
+						g_set_sel = 0;
+						g_set_touch_prev = false;
 						logprintf(
-							"Calidad: %s (aplica al reconectar)",
-							video_preset_label(
-								g_config
-									.video_preset));
+							"Abajo: Ajustes abiertos (B cierra)");
 					}
 				}
 			}
+		}
+
+		// Tactil en Ajustes (fase 4c): solo el DRC tiene tactil;
+		// tocar una fila la selecciona y activa con el mismo
+		// flujo que A. Geometria identica a draw_menu(854, 480).
+		if(error == VPAD_READ_SUCCESS && g_settings_open &&
+		   !g_session_active && !g_confirm_del && !g_swkbd_visible)
+		{
+			VPADTouchData tp = {};
+			VPADGetTPCalibratedPointEx(VPAD_CHAN_0, VPAD_TP_854X480,
+						 &tp, &status.tpNormal);
+			bool touched = tp.touched != 0;
+			int list_y, row_h;
+			settings_row_geom(854, &list_y, &row_h);
+			if(touched && !g_set_touch_prev &&
+			   (int)tp.y >= list_y)
+			{
+				int row = ((int)tp.y - list_y) / row_h;
+				if(row < SET_ROWS)
+				{
+					g_set_sel = row;
+					settings_activate(row);
+				}
+			}
+			g_set_touch_prev = touched;
 		}
 
 		// Toques de sesion: dos zonas en el DRC (la unica pantalla

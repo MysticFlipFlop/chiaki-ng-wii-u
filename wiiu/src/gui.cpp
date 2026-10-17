@@ -265,6 +265,33 @@ static bool font_create(void)
 		}
 	}
 
+	// Flechas de cursor U+2190..U+2193 (← ↑ → ↓) en las celdas
+	// libres 128-131 (zona C1 del atlas, en blanco: cp128-159 no
+	// tiene glifo y gui_text no la usa). Misma convención que
+	// font8x8: LSB del byte = píxel izquierdo.
+	static const uint8_t gui_arrows[4][8] = {
+		/* ← U+2190 */ { 0x08, 0x0c, 0x1c, 0xff, 0xff, 0x1c, 0x0c,
+				  0x08 },
+		/* ↑ U+2191 */ { 0x18, 0x3c, 0x7e, 0xff, 0x18, 0x18, 0x18,
+				  0x18 },
+		/* → U+2192 */ { 0x10, 0x30, 0x70, 0xff, 0xff, 0x70, 0x30,
+				  0x10 },
+		/* ↓ U+2193 */ { 0x18, 0x18, 0x18, 0x18, 0xff, 0x7e, 0x3c,
+				  0x18 },
+	};
+	for(int i = 0; i < 4; i++)
+	{
+		size_t cell = 128 + i;
+		size_t gx = (cell & 15) * 8, gy = (cell >> 4) * 8;
+		for(int r = 0; r < 8; r++)
+		{
+			uint8_t bits = gui_arrows[i][r];
+			uint8_t *dst = p + (gy + (size_t)r) * pitch + gx;
+			for(int c = 0; c < 8; c++)
+				dst[c] = (bits >> c) & 1 ? 0xFF : 0x00;
+		}
+	}
+
 	// Assets de chiaki-ng en la mitad derecha (wordmark; PS4 cuerpo y
 	// tira de luz por separado para teñirlos segun el estado).
 	for(int r = 0; r < ASSET_LOGO_H; r++)
@@ -497,8 +524,12 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, int scale)
 			y += dx;
 			continue;
 		}
+		// Flechas de cursor U+2190-U+2193 → celdas libres
+		// 128-131 (zona C1 del atlas, reservada en font_create).
+		if(cp >= 0x2190 && cp <= 0x2193)
+			cp = 128 + (cp - 0x2190);
 		// Fuente: U+0000-U+007F + U+00A0-U+00FF. El resto: '?'.
-		if(cp > 0xFF || (cp >= 0x80 && cp < 0xA0))
+		else if(cp > 0xFF || (cp >= 0x80 && cp < 0xA0))
 			cp = '?';
 		float u0 = (float)(cp & 15) * du;
 		float v0 = (float)(cp >> 4) * dv;
