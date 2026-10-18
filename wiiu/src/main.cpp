@@ -2023,7 +2023,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-65"
+#define APP_BUILD_TAG "gui-66"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2165,9 +2165,11 @@ static void draw_touchpad(int w, int h)
 	bool near_touch =
 		g_tp_down ||
 		OSGetTime() - g_tp_touch_t < OSMillisecondsToTicks(250);
+	// En reposo: plateado casi transparente (gui-66) — solo se
+	// intuye sobre el juego. Con el dedo encima, gris solido.
 	uint32_t col = near_touch ? GUI_RGBA(0x94, 0x94, 0x94, 0)
-				 : GUI_RGBA(0x3d, 0x3d, 0x3d, 0);
-	uint32_t a = (uint32_t)((near_touch ? 0xbf : 0x99) * fade + 0.5f);
+				 : GUI_RGBA(0xc8, 0xcc, 0xd4, 0);
+	uint32_t a = (uint32_t)((near_touch ? 0xbf : 0x40) * fade + 0.5f);
 	// (Con la codificacion BE de GUI_RGBA el alfa va en el byte bajo:
 	// col lleva a=0 y el fundido se OR-ea encima.)
 	gui_image((float)x, (float)y, (float)rw, (float)rh, tu, tv, tw, th,
