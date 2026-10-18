@@ -130,6 +130,14 @@ enum {
 static bool g_settings_open = false;
 static int g_set_sel = 0;
 static bool g_set_touch_prev = false;
+static bool g_menu_tap_prev = false; // toque del boton de Ajustes (gui-78)
+
+// Transicion de Ajustes (gui-80): la hoja sube con fundido al abrir y
+// se hunde al cerrar (B). ~220 ms con ease-out; sin input mientras.
+enum class SetAnim : uint8_t { None, Opening, Closing };
+#define SET_ANIM_MS 220
+static SetAnim g_set_anim = SetAnim::None;
+static uint64_t g_set_anim_t0;
 static char g_regist_target_host[CONFIG_HOST_SIZE]; // host del regist en curso
 
 // Menu contextual de presets de calidad (gui-61): se abre con A en la
@@ -2307,7 +2315,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-72"
+#define APP_BUILD_TAG "gui-80"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2946,6 +2954,44 @@ static void settings_activate(int row)
 	}
 }
 
+// Avance de la transicion de Ajustes0..1 (1 si no hay animacion).
+static float set_anim_progress(void)
+{
+	if(g_set_anim == SetAnim::None)
+		return 1.f;
+	float ms = (float)((OSGetTime() - g_set_anim_t0) /
+			   OSMillisecondsToTicks(1));
+	float t = ms / (float)SET_ANIM_MS;
+	return (t < 0.f) ? 0.f : ((t > 1.f) ? 1.f : t);
+}
+
+// Abre Ajustes con la transicion (gui-80); "how" entra en la linea
+// del log igual que antes (Abajo / Toque).
+static void settings_open_anim(const char *how)
+{
+	if(g_set_anim != SetAnim::None)
+		return;
+	g_settings_open = true;
+	g_set_sel = 0;
+	g_set_touch_prev = false;
+	g_set_anim = SetAnim::Opening;
+	g_set_anim_t0 = OSGetTime();
+	logprintf("%s: Ajustes abiertos (B cierra)", how);
+}
+
+// Geometria del boton de Ajustes con engranaje (gui-78): disco de u*6
+// en la esquina inferior izquierda, encima de "Ultima sesion". La
+// comparten el dibujo del menu y el toque del DRC (854x480).
+static void settings_button_geom(int w, int h, int *bx, int *by, int *bd)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	int m = w / 40;
+	*bd = u * 6;
+	*bx = m;
+	*by = h - m - u * 3 - *bd - u * 2;
+}
+
 static void draw_menu(int w, int h)
 {
 	// Escala2x en TV (>=1280) y1x en DRC: la fuente8x8 queda legible
@@ -3209,7 +3255,7 @@ static void draw_menu(int w, int h)
 		const char *label;
 	};
 	const TbSeg tb_segs[] = {
-		{ 0, "Registrar (↑)" },
+		{ 0, "PIN (↑)" },
 		{ '-', "ID" },
 		{ 'X', "IP" },
 		{ 'Y', "Buscar" },
@@ -3417,11 +3463,29 @@ static void draw_menu(int w, int h)
 					      ? "↑: registrar con el PIN de la PS4"
 					      : "←/→: elegir consola");
 	gui_text((float)m, (float)(h - m - u), foot, c_text2, scale);
+	// "Ultima sesion" sube una linea mas (gui-78): junto al pie no
+	// se leia como aviso aparte.
 	if(g_last_session_msg[0])
-		gui_text((float)m, (float)(h - m - u * 2), g_last_session_msg,
+		gui_text((float)m, (float)(h - m - u * 3), g_last_session_msg,
 			 c_text3, scale);
 	gui_text((float)(w - m) - gui_text_width(APP_BUILD_TAG, scale),
 		 (float)(h - m - u), APP_BUILD_TAG, c_text3, scale);
+
+	// Boton de Ajustes (gui-78): mismo circulo translucido que los
+	// botones de esquina del stream (gui-79) con un solo engranaje
+	// gris dentro; en el DRC responde al toque igual que Abajo.
+	int gx, gy, gd;
+	settings_button_geom(w, h, &gx, &gy, &gd);
+	float du, dv, dw, dh;
+	gui_asset_uvs(GUI_ASSET_DISC, &du, &dv, &dw, &dh);
+	float qu, qv, qw, qh;
+	gui_asset_uvs(GUI_ASSET_SETTINGS, &qu, &qv, &qw, &qh);
+	gui_image((float)gx, (float)gy, (float)gd, (float)gd, du, dv, dw,
+		  dh, GUI_RGBA(0x00, 0x00, 0x00, 0xb3));
+	float gs = (float)(gd - gd / 3); // engranaje mas grande (gui-80)
+	gui_image((float)gx + ((float)gd - gs) / 2.f,
+		  (float)gy + ((float)gd - gs) / 2.f, gs, gs, qu, qv, qw,
+		  qh, c_chip);
 
 	// Dialogo modal de confirmacion de borrado (solo desde la fila
 	// "Eliminar consola" de Ajustes): scrim + carta Material
@@ -3469,6 +3533,44 @@ static void draw_menu(int w, int h)
 	}
 
 	gui_flush();
+}
+
+// Lista o Ajustes con transicion (gui-80): con animacion activa
+// dibuja la lista como base y la hoja de Ajustes encima, subiendo
+// (abrir) o hundiendose (cerrar) con fundido ease-out; al terminar
+// fija el estado definitivo (cerrar -> g_settings_open = false).
+static void draw_menu_any(int w, int h)
+{
+	if(g_set_anim == SetAnim::None)
+	{
+		draw_menu(w, h);
+		return;
+	}
+	float t = set_anim_progress();
+	float k = 1.f - t;
+	float e = 1.f - k * k * k; // ease-out cubico
+	bool opening = (g_set_anim == SetAnim::Opening);
+	bool saved = g_settings_open;
+
+	// Capa base: la lista principal (igual que antes de abrir).
+	g_settings_open = false;
+	draw_menu(w, h);
+
+	// Capa de Ajustes: desplazada con fundido sobre la lista.
+	g_settings_open = true;
+	gui_set_offset(0.f, (opening ? k : e) * (float)h);
+	gui_set_fade(opening ? e : 1.f - e);
+	draw_menu(w, h);
+	gui_set_offset(0.f, 0.f);
+	gui_set_fade(1.f);
+	g_settings_open = saved;
+
+	if(t >= 1.f)
+	{
+		if(!opening)
+			g_settings_open = false;
+		g_set_anim = SetAnim::None;
+	}
 }
 
 int main(int argc, char **argv)
@@ -3666,6 +3768,12 @@ int main(int argc, char **argv)
 						g_confirm_del = false;
 					}
 				}
+				// Transicion de Ajustes (gui-80): ~220 ms
+				// sin input para que la hoja no reciba
+				// teclas a medio camino.
+				else if(g_set_anim != SetAnim::None)
+				{
+				}
 				else if(g_settings_open)
 				{
 					// Menu contextual de presets (gui-61):
@@ -3699,7 +3807,13 @@ int main(int argc, char **argv)
 					// menu quedan consumidas; B cierra.
 					else if(rising & VPAD_BUTTON_B)
 					{
-						g_settings_open = false;
+						// Cierre animado (gui-80):
+						// g_settings_open sigue
+						// true hasta que la hoja
+						// termine de hundirse.
+						g_set_anim =
+							SetAnim::Closing;
+						g_set_anim_t0 = OSGetTime();
 						g_set_touch_prev = false;
 						logprintf("Ajustes: cerrados");
 					}
@@ -3849,13 +3963,7 @@ int main(int argc, char **argv)
 						logprintf(
 							"Abajo: en sesion (B para parar)");
 					else
-					{
-						g_settings_open = true;
-						g_set_sel = 0;
-						g_set_touch_prev = false;
-						logprintf(
-							"Abajo: Ajustes abiertos (B cierra)");
-					}
+						settings_open_anim("Abajo");
 				}
 			}
 		}
@@ -3864,7 +3972,8 @@ int main(int argc, char **argv)
 		// tocar una fila la selecciona y activa con el mismo
 		// flujo que A. Geometria identica a draw_menu(854, 480).
 		if(error == VPAD_READ_SUCCESS && g_settings_open &&
-		   !g_session_active && !g_confirm_del && !g_swkbd_visible)
+		   g_set_anim == SetAnim::None && !g_session_active &&
+		   !g_confirm_del && !g_swkbd_visible)
 		{
 			VPADTouchData tp = {};
 			VPADGetTPCalibratedPointEx(VPAD_CHAN_0, VPAD_TP_854X480,
@@ -3921,6 +4030,28 @@ int main(int argc, char **argv)
 				}
 			}
 			g_set_touch_prev = touched;
+		}
+
+		// Toque en el boton de Ajustes del menu principal (gui-78):
+		// mismo gesto que Abajo, solo con el menu a la vista; su
+		// propio flag evita que el toque de Ajustes lo pise.
+		if(error == VPAD_READ_SUCCESS && !g_session_active &&
+		   !g_settings_open && !g_confirm_del && !g_swkbd_visible)
+		{
+			VPADTouchData tp = {};
+			VPADGetTPCalibratedPointEx(VPAD_CHAN_0, VPAD_TP_854X480,
+						 &tp, &status.tpNormal);
+			bool touched = tp.touched != 0;
+			if(touched && !g_menu_tap_prev)
+			{
+				int bx, by, bd;
+				settings_button_geom(854, 480, &bx, &by, &bd);
+				if((int)tp.x >= bx && (int)tp.x < bx + bd &&
+				   (int)tp.y >= by &&
+				   (int)tp.y < by + bd)
+					settings_open_anim("Toque");
+			}
+			g_menu_tap_prev = touched;
 		}
 
 		// Toques de sesion: dos zonas en el DRC (la unica pantalla
@@ -4602,7 +4733,7 @@ int main(int argc, char **argv)
 			// touchpad tampoco se pinta aquí (no tapa el juego).
 		}
 		else
-			draw_menu(1920, 1080);
+			draw_menu_any(1920, 1080);
 		if(g_swkbd_visible)
 			nn::swkbd::DrawTV();
 		WHBGfxFinishRenderTV();
@@ -4619,7 +4750,7 @@ int main(int argc, char **argv)
 			draw_touchpad(854, 480);
 		}
 		else
-			draw_menu(854, 480);
+			draw_menu_any(854, 480);
 		if(g_swkbd_visible)
 			nn::swkbd::DrawDRC();
 		WHBGfxFinishRenderDRC();

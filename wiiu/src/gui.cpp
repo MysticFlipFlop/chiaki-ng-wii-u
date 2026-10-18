@@ -53,7 +53,7 @@
 #include <string.h>
 
 #define FONT_TEX_W 256 // mitad izq: glifos; mitad der: assets
-#define FONT_TEX_H 224 // glifos (128) + blanco (8) + assets hasta 224
+#define FONT_TEX_H 256 // glifos (128) + blanco (8) + assets hasta 255
 #define FONT_WHITE_ROW 128 // filas de bloque blanco para solidos
 #define FONT_WHITE_H 8
 
@@ -79,6 +79,9 @@
 #define ASSET_MIC_S 32             // iconos de microfono (microphone*.svg)
 #define ASSET_MIC_X (ASSET_OFF_X + ASSET_OFF_S) // x192: micrófono activo
 #define ASSET_MIC_OFF_X (ASSET_MIC_X + ASSET_MIC_S) // x224: silenciado
+#define ASSET_SETTINGS_S 32        // engranaje de Ajustes (gui-78)
+#define ASSET_SETTINGS_X ASSET_LOGO_X
+#define ASSET_SETTINGS_Y 224       // fila nueva bajo los assets
 #define ASSET_MIC_Y ASSET_DISC_Y
 // Superficie del touchpad en la mitad IZQUIERDA: filas 136+ son virgenes
 // (los glifos acaban en la 127 y el bloque blanco ocupa 128-135).
@@ -349,6 +352,12 @@ static bool font_create(void)
 		       gui_mic_off_mask + (size_t)r * ASSET_MIC_S,
 		       ASSET_MIC_S);
 	}
+	// Engranaje de Ajustes en la fila y224 (nueva altura del atlas).
+	for(int r = 0; r < ASSET_SETTINGS_S; r++)
+		memcpy(p + (size_t)(ASSET_SETTINGS_Y + r) * pitch +
+			       ASSET_SETTINGS_X,
+		       gui_settings_mask + (size_t)r * ASSET_SETTINGS_S,
+		       ASSET_SETTINGS_S);
 	for(int r = 0; r < ASSET_TP_H; r++)
 		memcpy(p + (size_t)(ASSET_TP_Y + r) * pitch + ASSET_TP_X,
 		       gui_touchpad + (size_t)r * ASSET_TP_W, ASSET_TP_W);
@@ -477,11 +486,35 @@ static void set_proj(int w, int h)
 #define WHITE_U (0.5f / (float)FONT_TEX_W)
 #define WHITE_V ((FONT_WHITE_ROW + 4.f) / (float)FONT_TEX_H)
 
+// Desplazamiento y fundido globales para la transicion de Ajustes
+// (gui-80): aplicados dentro de push_quad; siempre volver a (0,0)/1.
+static float s_off_x, s_off_y;
+static float s_fade = 1.f;
+
+void gui_set_offset(float ox, float oy)
+{
+	s_off_x = ox;
+	s_off_y = oy;
+}
+
+void gui_set_fade(float a)
+{
+	s_fade = a;
+}
+
 static void push_quad(float x, float y, float w, float h, uint32_t color,
 		      float u0, float v0, float u1, float v1)
 {
 	if(!s_in_begin || s_nv + 4 > MAX_VERTS)
 		return;
+	x += s_off_x;
+	y += s_off_y;
+	if(s_fade < 1.f)
+	{
+		uint32_t a = (uint32_t)((float)(color & 0xffu) * s_fade +
+					0.5f);
+		color = (color & 0xffffff00u) | a;
+	}
 	// Orden de PERIMETRO (TL,TR,BR,BL): GX2 triangula el quad en
 	// (v0,v1,v2)+(v0,v2,v3) y el orden zigzag deja un triángulo
 	// sin cubrir (mismo hallazgo que en el blit de video).
@@ -661,6 +694,12 @@ void gui_asset_uvs(GuiAsset asset, float *u, float *v, float *w, float *h)
 		*v = (float)ASSET_TP_Y / ah;
 		*w = (float)ASSET_TP_W / aw;
 		*h = (float)ASSET_TP_H / ah;
+		break;
+	case GUI_ASSET_SETTINGS:
+		*u = (float)ASSET_SETTINGS_X / aw;
+		*v = (float)ASSET_SETTINGS_Y / ah;
+		*w = (float)ASSET_SETTINGS_S / aw;
+		*h = (float)ASSET_SETTINGS_S / ah;
 		break;
 	}
 }

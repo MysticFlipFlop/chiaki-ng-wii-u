@@ -51,7 +51,13 @@ typedef enum GuiAsset {
 	GUI_ASSET_MIC,       // micrófono activo (microphone.svg)
 	GUI_ASSET_MIC_SLASH, // micrófono silenciado (microphone-slash.svg)
 	GUI_ASSET_TOUCHPAD,  // superficie touchpad (touchpad_surface.svg)
+	GUI_ASSET_SETTINGS,  // engranaje de Ajustes (settings.svg)
 } GuiAsset;
 void gui_asset_uvs(GuiAsset asset, float *u, float *v, float *w, float *h);
 
 void gui_flush(void);
+
+// Transicion de Ajustes (gui-80): desplaza/funde todo lo dibujado
+// mientras esta activo; volver a (0,0) y 1.0 al terminar.
+void gui_set_offset(float ox, float oy);
+void gui_set_fade(float a);
