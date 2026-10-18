@@ -266,7 +266,8 @@ static bool font_create(void)
 	}
 
 	// Flechas de cursor U+2190..U+2193 (← ↑ → ↓) en las celdas
-	// libres 128-131 (zona C1 del atlas, en blanco: cp128-159 no
+	// libres 128-131 y el ✓ del checkbox en la celda 132 (zona C1
+	// del atlas, en blanco: cp128-159 no
 	// tiene glifo y gui_text no la usa). Misma convención que
 	// font8x8: LSB del byte = píxel izquierdo.
 	static const uint8_t gui_arrows[4][8] = {
@@ -286,6 +287,21 @@ static bool font_create(void)
 		for(int r = 0; r < 8; r++)
 		{
 			uint8_t bits = gui_arrows[i][r];
+			uint8_t *dst = p + (gy + (size_t)r) * pitch + gx;
+			for(int c = 0; c < 8; c++)
+				dst[c] = (bits >> c) & 1 ? 0xFF : 0x00;
+		}
+	}
+
+	// ✓ del checkbox de VSync (U+2713) en la celda 132, al lado de
+	// las flechas; misma convención de bits (LSB = píxel izquierdo).
+	static const uint8_t gui_check[8] = { 0x80, 0xc0, 0x60, 0x31, 0x1a,
+					   0x07, 0x00, 0x00 };
+	{
+		size_t gx = (132 & 15) * 8, gy = (132 >> 4) * 8;
+		for(int r = 0; r < 8; r++)
+		{
+			uint8_t bits = gui_check[r];
 			uint8_t *dst = p + (gy + (size_t)r) * pitch + gx;
 			for(int c = 0; c < 8; c++)
 				dst[c] = (bits >> c) & 1 ? 0xFF : 0x00;
@@ -525,9 +541,12 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, int scale)
 			continue;
 		}
 		// Flechas de cursor U+2190-U+2193 → celdas libres
-		// 128-131 (zona C1 del atlas, reservada en font_create).
+		// 128-131 y el ✓ (U+2713) del checkbox → celda 132
+		// (zona C1 del atlas, reservada en font_create).
 		if(cp >= 0x2190 && cp <= 0x2193)
 			cp = 128 + (cp - 0x2190);
+		else if(cp == 0x2713)
+			cp = 132;
 		// Fuente: U+0000-U+007F + U+00A0-U+00FF. El resto: '?'.
 		else if(cp > 0xFF || (cp >= 0x80 && cp < 0xA0))
 			cp = '?';

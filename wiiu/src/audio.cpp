@@ -18,9 +18,9 @@
 //
 // Camino del audio:
 //   PS4 -> opus -> sink de chiaki (hilo de sesion) -> ganancia de
-//   volumen x6 con recorte duro -> ring de staging (entrelazado)
-//   -> ring AX (desentrelazado, I y D, en bucle) -> voces AX ->
-//   mixer 48 kHz -> TV/GamePad.
+//   volumen x2 + limitador suave (tanh) -> ring de staging
+//   (entrelazado) -> ring AX (desentrelazado, I y D, en bucle) ->
+//   voces AX -> mixer 48 kHz -> TV/GamePad.
 //
 // El DSP lee el ring por DMA, asi que tras cada relleno se limpia la
 // cache (DCFlushRange).
@@ -62,17 +62,23 @@
 #define TONE_LUT_SAMPLES 100u
 #define TONE_AMPLITUDE 8192
 
-// Ganancia de volumen: el PCM opus que manda la PS4 llega bajo y en
-// consola el volumen de sistema ya esta al maximo (en el PC se sube
-// el mixer del SO, aqui no hay mas escalon que la propia ganancia).
-// Mismo arreglo que el puerto Switch de chiaki-ng (switch/src/io.cpp,
-// AudioCB: ganancia con recorte duro). Medido en gui-48 (MHW,
-// hardware): el pico de la fuente ronda 4000-4500 (-18 dBFS), asi
-// que x6 lleva el pico a ~27000 (-1.7 dBFS) sin llegar al recorte;
-// si en otro juego el pico pasa de ~5461, ahi empieza el recorte
-// (intencionado, igual que en el Switch) y habria que bajar a x4-x5.
-#define AUDIO_GAIN_NUM 6
+// Ganancia de volumen: el PCM opus que manda la PS4 llega bajo en
+// juegos tranquilos (medido en gui-48, MHW: pico 4000-4500 = -18
+// dBFS), pero otros juegos lo mandan ya a escala completa (gui-56,
+// Borderlands2: picos pegados a -32768 en cada ventana de log). El
+// recorte duro (x6, luego x4) cuadraba la onda de esos juegos y
+// sonaba a raspado. Ahora (gui-57): x2 + limitador suave — por
+// debajo de la rodilla el camino es entero y sin perdida; por
+// encima tanh redondea en vez de cuadrar. Si aun asi un juego suena
+// raspado, el pico ya viene recortado de la PS4 y habria que bajar
+// a x1 (ganancia unidad).
+#define AUDIO_GAIN_NUM 2
 #define AUDIO_GAIN_DEN 1
+// Rodilla del limitador suave (gui-57): por encima de aqui la
+// transferencia es tanh hacia el tope int16. Con x2 equivale a pico
+// de fuente >=11468 (-11 dBFS); el limite teorico de recorte duro
+// (32767/2 = 16384) queda cubierto por la rodilla.
+#define AUDIO_SOFT_KNEE 22937
 
 // Hilo de init de AX: el backend de SDL de devkitPro exige que la
 // configuracion de las voces se haga en CPU1.
@@ -122,7 +128,9 @@ static uint32_t g_tone_phase = 0;
 static uint32_t g_fill_total = 0; // frames rellenados (para el tono/log)
 // Pico de |muestra| de la fuente (ANTES de la ganancia) entre logs:
 // si el pico llega bajo, la fuente es la que viene corta y hay que
-// subir la ganancia; si llega a >=5461, x6 ya esta recortando.
+// subir la ganancia; con x2, un pico >=11468 ya entra en el
+// limitador suave, y32768 = fuente pegada al tope (0 dBFS, el
+// propio juego sale recortado).
 static volatile uint32_t g_peak_src = 0;
 
 void audio_set_log(void (*log_fn)(const char *))
@@ -280,7 +288,7 @@ bool audio_init(void)
 	g_inited = true;
 	audio_log("Audio: 2 voces AX listas (LPCM16 mono c/u, ring %u ms)",
 		  (unsigned int)(AX_RING_FRAMES / 48));
-	audio_log("Audio: ganancia de PCM x6 (recorte duro)");
+	audio_log("Audio: ganancia de PCM x2 + limitador suave (rodilla 0.7 FS)");
 	return true;
 }
 
@@ -349,9 +357,12 @@ void audio_session_stop(void)
 		AXSetVoiceState(g_voice[1], AX_VOICE_STATE_STOPPED);
 }
 
-// Copia PCM al staging aplicando la ganancia de volumen (entero 9/5)
-// con recorte duro a int16, y mide de paso el pico de la fuente
-// antes de ganar (para el log de diagnostico).
+// Copia PCM al staging aplicando la ganancia de volumen (entero,
+// AUDIO_GAIN_NUM/DEN = x2) con limitador suave a int16: por debajo
+// de AUDIO_SOFT_KNEE el camino es entero puro; por encima tanh
+// redondea la transferencia en vez de cuadrarla (recorte duro ->
+// raspado, ver gui-56/57 con Borderlands2). Mide de paso el pico de
+// la fuente antes de ganar (para el log de diagnostico).
 static void stage_gain_copy(int16_t *dst, const int16_t *src,
 			    size_t samples)
 {
@@ -362,10 +373,17 @@ static void stage_gain_copy(int16_t *dst, const int16_t *src,
 		if((uint32_t)a > g_peak_src)
 			g_peak_src = (uint32_t)a;
 		int32_t v = (s * AUDIO_GAIN_NUM) / AUDIO_GAIN_DEN;
-		if(v > 32767)
-			v = 32767;
-		else if(v < -32768)
-			v = -32768;
+		if(v > AUDIO_SOFT_KNEE || v < -AUDIO_SOFT_KNEE)
+		{
+			// Zona de rodilla: tanh suave hacia el tope.
+			float f = (float)v;
+			float m = fabsf(f);
+			m = (float)AUDIO_SOFT_KNEE +
+			    (32767.f - (float)AUDIO_SOFT_KNEE) *
+				    tanhf((m - (float)AUDIO_SOFT_KNEE) /
+					  (32767.f - (float)AUDIO_SOFT_KNEE));
+			v = (int32_t)(f < 0.f ? -m : m);
+		}
 		dst[i] = (int16_t)v;
 	}
 }

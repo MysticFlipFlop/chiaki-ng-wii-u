@@ -49,6 +49,12 @@ struct Config
 	// 10 Mbps) — un config viejo caera en otro preset; re-elegir
 	// con ZL/ZR lo corrige.
 	int video_preset;
+	// VSync (gui-59): 1 = activado (default; GX2SetSwapInterval(1),
+	// presentacion bloqueada al retrace, sin tearing); 0 =
+	// desactivado (swap inmediato: quita la espera de vsync de la
+	// latencia, puede enseñar tearing). Se aplica al arrancar y al
+	// alternar la fila de Ajustes.
+	int vsync;
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
 

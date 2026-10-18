@@ -18,7 +18,7 @@
  *   Y = borrar IP y volver a broadcast 255.255.255.255
  *   ↑ = registrar consola (ID PSN + PIN de "Enlazar con otro dispositivo")
  *   SELECT = editar el Account ID de PSN en cualquier momento
- *   ↓ = Ajustes (ID PSN, IP, calidad de video, eliminar consola)
+ *   ↓ = Ajustes (ID PSN, IP, calidad, vsync, eliminar consola)
  *   A = conectar Remote Play (despierta la PS4 si esta en standby)
  *   B = durante la conexion de la sesion, cancela. Con stream activo
  *       (fase 3c) el mando va al juego: layout por posicion fisica
@@ -38,6 +38,7 @@
 #include <whb/log_udp.h>
 #include <whb/crash.h>
 #include <whb/gfx.h>
+#include <gx2/swap.h> // GX2SetSwapInterval (opcion VSync de Ajustes)
 #include <vpad/input.h>
 #include <nsysnet/_socket.h>
 #include <coreinit/time.h>
@@ -110,11 +111,13 @@ static int g_menu_sel = 0;
 // Mismos flujos que las teclas del menu: cuenta = SELECT, IP = X,
 // calidad = ZL/ZR (solo dentro de Ajustes); eliminar consola abre el
 // dialogo de confirmacion — el borrado vive unicamente aqui, sin
-// atajo PLUS en la lista principal.
+// atajo PLUS en la lista principal. VSync (gui-59) alterna
+// GX2SetSwapInterval(1/0) al instante.
 enum {
 	SET_ROW_ACCOUNT = 0,
 	SET_ROW_IP,
 	SET_ROW_QUALITY,
+	SET_ROW_VSYNC,
 	SET_ROW_DELETE,
 	SET_ROWS,
 };
@@ -123,7 +126,13 @@ static int g_set_sel = 0;
 static bool g_set_touch_prev = false;
 static char g_regist_target_host[CONFIG_HOST_SIZE]; // host del regist en curso
 
-// Dialogo modal de confirmacion de borrado (PLUS en la toolbar): sin
+// Menu contextual de presets de calidad (gui-61): se abre con A en la
+// fila de Calidad de Ajustes — lista los 9 presets del ladder para
+// elegir sin ciclar uno a uno.
+static bool g_qual_menu_open = false;
+static int g_qual_menu_sel = 0;
+
+// Dialogo modal de confirmacion de borrado (solo desde Ajustes): sin
 // navegacion — A confirma y B vuelve (como los dialogs de consola).
 static bool g_confirm_del = false;
 
@@ -1984,7 +1993,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-56"
+#define APP_BUILD_TAG "gui-61"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2140,6 +2149,22 @@ static void settings_row_geom(int w, int *list_y, int *row_h)
 	*row_h = u * 7;
 }
 
+// Geometria del menu contextual de presets (gui-61): panel centrado
+// con titulo y lista; compartida por el dibujo (TV y DRC) y el tactil
+// del DRC (854x480). Filas mas compactas en la TV para que quepan los
+// presets en 720.
+static void quality_menu_geom(int w, int h, int *px, int *py, int *pw,
+			      int *ph, int *row_h)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	*pw = u * 22;
+	*row_h = (scale == 2) ? u * 3 : u * 4;
+	*ph = u * 4 + *row_h * VIDEO_PRESET_COUNT + u * 3;
+	*px = (w - *pw) / 2;
+	*py = (h - *ph) / 2;
+}
+
 // Cicla el perfil de calidad (fase 4c) en la direccion dada: ZL/ZR y
 // la fila de Ajustes lo usan. Solo fuera de sesion: el perfil se
 // negocia al abrir el stream, asi que aplica al reconectar.
@@ -2156,6 +2181,37 @@ static void settings_cycle_quality(int dir)
 	g_config_dirty = true;
 	logprintf("Calidad: %s (aplica al reconectar)",
 		  video_preset_label(g_config.video_preset));
+}
+
+// Menu contextual de presets (gui-61): mueve la seleccion con wrap.
+static void quality_menu_move(int dir)
+{
+	g_qual_menu_sel = (g_qual_menu_sel + dir + VIDEO_PRESET_COUNT) %
+			   VIDEO_PRESET_COUNT;
+}
+
+// Menu contextual de presets (gui-61): aplica el marcado y cierra —
+// igual que settings_cycle_quality (config + log, vale al reconectar).
+static void quality_menu_apply(void)
+{
+	g_config.video_preset = g_qual_menu_sel;
+	g_config_dirty = true;
+	logprintf("Calidad: %s (aplica al reconectar)",
+		  video_preset_label(g_qual_menu_sel));
+	g_qual_menu_open = false;
+}
+
+// VSync (gui-59): alterna GX2SetSwapInterval(1/0), la espera de
+// retrace que fija WHBGfxInit. ON: presentacion alineada al vsync
+// (sin tearing, ~media vuelta de espera media). OFF: swap inmediato —
+// WHBGfxBeginRender ya no espera flip y el bucle corre suelto (menos
+// latencia, posible tearing). Efecto inmediato; persiste en config.ini.
+static void settings_toggle_vsync(void)
+{
+	g_config.vsync = g_config.vsync ? 0 : 1;
+	g_config_dirty = true;
+	GX2SetSwapInterval((uint32_t)g_config.vsync);
+	logprintf("VSync: %s", g_config.vsync ? "activado" : "desactivado");
 }
 
 // Accion de una fila de Ajustes (A o toque en el DRC).
@@ -2183,12 +2239,22 @@ static void settings_activate(int row)
 		swkbd_show(Prompt::IP);
 	}
 	else if(row == SET_ROW_QUALITY)
-		settings_cycle_quality(1);
+	{
+		// Menu contextual (gui-61): lista los presets en vez
+		// de ciclar a ciegas; arranca marcado el actual y B
+		// cierra sin tocar nada.
+		g_qual_menu_sel = video_preset_cur();
+		g_qual_menu_open = true;
+		logprintf("Calidad: menu de presets (%d opciones)",
+			  VIDEO_PRESET_COUNT);
+	}
+	else if(row == SET_ROW_VSYNC)
+		settings_toggle_vsync();
 	else if(row == SET_ROW_DELETE)
 	{
-		// Ultima fila de Ajustes: mismo flujo que PLUS. Cierra
-		// Ajustes (el dialogo se dibuja sobre la lista) y abre
-		// la confirmacion — B vuelve, A elimina.
+		// Ultima fila de Ajustes. Cierra Ajustes (el dialogo
+		// se dibuja sobre la lista) y abre la confirmacion —
+		// B vuelve, A elimina.
 		int cnt = config_console_count(&g_config);
 		if(g_session_active)
 			logprintf("Ajustes: en sesion (B para parar)");
@@ -2331,11 +2397,17 @@ static void draw_menu(int w, int h)
 					 video_preset_label(
 						 video_preset_cur()));
 			}
+			else if(i == SET_ROW_VSYNC)
+			{
+				label = "VSync";
+				value[0] = '\0'; // estado: checkbox, sin
+				                   // texto de valor
+			}
 			else
 			{
 				// Ultima fila: elimina la consola
-				// seleccionada en la lista (mismo
-				// dialogo de confirmacion que PLUS).
+				// seleccionada en la lista (dialogo
+				// de confirmacion).
 				label = "Eliminar consola";
 				int cnt = config_console_count(&g_config);
 				if(cnt > 0)
@@ -2366,15 +2438,93 @@ static void draw_menu(int w, int h)
 			gui_text((float)(w - m - u * 2) -
 					 gui_text_width(value, scale),
 				 (float)ty, value, vc, scale);
+			// Checkbox de VSync (gui-60): caja Material a la
+			// derecha — rellena en accent con ✓ si activo, solo
+			// borde (c_text2) si no; el interior del borde
+			// respeta el tinte de la fila activa.
+			if(i == SET_ROW_VSYNC)
+			{
+				float cb = (float)(u * 3 / 2); // 12 / 24 px
+				float cbx = (float)(w - m - u * 2) - cb;
+				float cby = (float)y +
+					     ((float)row_h - cb) / 2.f;
+				if(g_config.vsync)
+				{
+					gui_rect(cbx, cby, cb, cb, c_accent);
+					gui_text(cbx + (cb - (float)u) / 2.f,
+						 cby + (cb - (float)u) / 2.f,
+						 "✓", c_white, scale);
+				}
+				else
+				{
+					float th = (float)scale;
+					gui_rect(cbx, cby, cb, th, vc);
+					gui_rect(cbx, cby + cb - th, cb, th,
+						 vc);
+					gui_rect(cbx, cby, th, cb, vc);
+					gui_rect(cbx + cb - th, cby, th, cb,
+						 vc);
+				}
+			}
 			if(is_sel)
 				gui_text((float)(w - m - u), (float)ty, ">",
 					 c_accent, scale);
 		}
 
-		const char *hint =
-			"↑/↓: elegir   A o tocar: abrir   B: volver";
-		gui_text(((float)w - gui_text_width(hint, scale)) / 2.f,
-			 (float)(h - u * 2), hint, c_text3, scale);
+		// Sin hint de Ajustes con el menu de presets abierto: su
+		// propio hint ocupa esa linea (evita texto doble).
+		if(!g_qual_menu_open)
+		{
+			const char *hint =
+				"↑/↓: elegir   A o tocar: abrir   B: volver";
+			gui_text(
+				((float)w - gui_text_width(hint, scale)) /
+					2.f,
+				(float)(h - u * 2), hint, c_text3, scale);
+		}
+
+		// Menu contextual de presets (gui-61): scrim + panel
+		// Material centrado; el ✓ marca el preset actual y el
+		// cursor va con tinte + barra (etiquetas en blanco).
+		if(g_qual_menu_open)
+		{
+			int px, py, pw, ph, mrow;
+			quality_menu_geom(w, h, &px, &py, &pw, &ph, &mrow);
+			gui_rect(0.f, 0.f, (float)w, (float)h,
+				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
+			gui_rect((float)px, (float)py, (float)pw, (float)ph,
+				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
+			gui_text((float)(px + u * 2), (float)(py + u * 2),
+				 "Calidad de video", c_text, scale);
+			int cur = video_preset_cur();
+			for(int i = 0; i < VIDEO_PRESET_COUNT; i++)
+			{
+				int ry = py + u * 4 + i * mrow;
+				if(i == g_qual_menu_sel)
+				{
+					gui_rect((float)px, (float)ry,
+						 (float)pw, (float)mrow,
+						 GUI_RGBA(0x00, 0xa7, 0xff,
+							  0x59));
+					gui_rect((float)px, (float)ry,
+						 (float)(u / 2),
+						 (float)mrow, c_accent);
+				}
+				int ty = ry + (mrow - u) / 2;
+				gui_text((float)(px + u * 2), (float)ty,
+					 video_preset_label(i), c_text,
+					 scale);
+				if(i == cur)
+					gui_text((float)(px + pw - u * 3),
+						 (float)ty, "✓",
+						 c_accent, scale);
+			}
+			const char *qhint = "↑/↓: elegir   A: elegir   B: cerrar";
+			gui_text(
+				((float)w - gui_text_width(qhint, scale)) /
+					2.f,
+				(float)(h - u * 2), qhint, c_text3, scale);
+		}
 		gui_flush();
 		return;
 	}
@@ -2720,6 +2870,12 @@ int main(int argc, char **argv)
 	logprintf("init: config");
 	config_init(&g_config);
 	config_load_sd();
+	// VSync (gui-59): aplicar la preferencia guardada. WHBGfxInit
+	// deja GX2SetSwapInterval(1); con 0 el swap es inmediato (menos
+	// latencia, posible tearing en TV y DRC).
+	GX2SetSwapInterval((uint32_t)g_config.vsync);
+	logprintf("Config: vsync=%d (%s)", g_config.vsync,
+		  g_config.vsync ? "activado" : "desactivado");
 
 	// Requiere socket_lib_init ya hecho (crea sockets y threads).
 	logprintf("init: discovery");
@@ -2835,9 +2991,36 @@ int main(int argc, char **argv)
 				}
 				else if(g_settings_open)
 				{
+					// Menu contextual de presets (gui-61):
+					// consume el input antes que la
+					// lista de Ajustes mientras este
+					// abierto.
+					if(g_qual_menu_open)
+					{
+						if(rising & VPAD_BUTTON_B)
+						{
+							g_qual_menu_open =
+								false;
+							logprintf(
+								"Calidad: menu cerrado");
+						}
+						else if(rising &
+							(VPAD_BUTTON_DOWN |
+							 VPAD_BUTTON_RIGHT |
+							 VPAD_BUTTON_ZR))
+							quality_menu_move(1);
+						else if(rising &
+							(VPAD_BUTTON_UP |
+							 VPAD_BUTTON_LEFT |
+							 VPAD_BUTTON_ZL))
+							quality_menu_move(-1);
+						else if(rising &
+							VPAD_BUTTON_A)
+							quality_menu_apply();
+					}
 					// Fase 4c: en Ajustes las teclas del
 					// menu quedan consumidas; B cierra.
-					if(rising & VPAD_BUTTON_B)
+					else if(rising & VPAD_BUTTON_B)
 					{
 						g_settings_open = false;
 						g_set_touch_prev = false;
@@ -2871,6 +3054,9 @@ int main(int argc, char **argv)
 								(rising & VPAD_BUTTON_RIGHT)
 									? 1
 									: -1);
+						else if(g_set_sel ==
+							SET_ROW_VSYNC)
+							settings_toggle_vsync();
 					}
 				}
 				else if(rising & VPAD_BUTTON_X)
@@ -3007,16 +3193,54 @@ int main(int argc, char **argv)
 			VPADGetTPCalibratedPointEx(VPAD_CHAN_0, VPAD_TP_854X480,
 						 &tp, &status.tpNormal);
 			bool touched = tp.touched != 0;
-			int list_y, row_h;
-			settings_row_geom(854, &list_y, &row_h);
-			if(touched && !g_set_touch_prev &&
-			   (int)tp.y >= list_y)
+			if(touched && !g_set_touch_prev)
 			{
-				int row = ((int)tp.y - list_y) / row_h;
-				if(row < SET_ROWS)
+				// Menu contextual (gui-61): toque en una
+				// fila la elige; fuera del panel cierra
+				// (como B).
+				if(g_qual_menu_open)
 				{
-					g_set_sel = row;
-					settings_activate(row);
+					int px, py, pw, ph, mrow;
+					quality_menu_geom(854, 480, &px, &py,
+							  &pw, &ph, &mrow);
+					// u=8 en el DRC (scale 1): filas a
+					// py + u*4 (debajo del titulo).
+					int rows_y = py + 32;
+					int row = ((int)tp.y - rows_y) / mrow;
+					if((int)tp.x >= px &&
+					   (int)tp.x < px + pw &&
+					   (int)tp.y >= rows_y &&
+					   row >= 0 &&
+					   row < VIDEO_PRESET_COUNT &&
+					   (int)tp.y < rows_y + mrow *
+								   VIDEO_PRESET_COUNT)
+					{
+						g_qual_menu_sel = row;
+						quality_menu_apply();
+					}
+					else
+					{
+						g_qual_menu_open = false;
+						logprintf(
+							"Calidad: menu cerrado");
+					}
+				}
+				else
+				{
+					int list_y, row_h;
+					settings_row_geom(854, &list_y,
+							  &row_h);
+					if((int)tp.y >= list_y)
+					{
+						int row = ((int)tp.y -
+							   list_y) /
+							  row_h;
+						if(row < SET_ROWS)
+						{
+							g_set_sel = row;
+							settings_activate(row);
+						}
+					}
 				}
 			}
 			g_set_touch_prev = touched;

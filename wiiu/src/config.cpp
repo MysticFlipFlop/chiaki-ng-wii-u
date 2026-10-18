@@ -71,6 +71,7 @@ static bool field_copy(char *dst, size_t dst_size, const char *start,
 void config_init(Config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
+	cfg->vsync = 1; // default: vsync activado (gui-59)
 }
 
 int config_find(const Config *cfg, const char *host)
@@ -152,9 +153,9 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 		return 0;
 
 	size_t off = (size_t)snprintf(buf, buf_size,
-				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\n",
+				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\nvsync=%d\n",
 				      cfg->account_id_hex, cfg->last_host,
-				      cfg->video_preset);
+				      cfg->video_preset, cfg->vsync);
 	if(off >= buf_size)
 		off = buf_size - 1;
 
@@ -259,6 +260,8 @@ void config_parse(Config *cfg, const char *buf, size_t len)
 						   val, line_end);
 				else if(!strcmp(key, "video_preset"))
 					cfg->video_preset = atoi(val);
+				else if(!strcmp(key, "vsync"))
+					cfg->vsync = atoi(val) ? 1 : 0;
 				else if(!strcmp(key, "console"))
 					parse_console_line(cfg, val, line_end);
 				// claves desconocidas: se ignoran (compatibilidad

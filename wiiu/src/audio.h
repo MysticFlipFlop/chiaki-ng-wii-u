@@ -35,5 +35,5 @@ void audio_update(void);
 
 // Sink de chiaki (hilo de sesion): PCM ya decodificado (s16le estereo
 // 48 kHz). No bloquear: copia a un ring interno aplicando la ganancia
-// x6 con recorte duro (ver audio.cpp, estilo puerto Switch).
+// x2 con limitador suave tanh (ver audio.cpp).
 void audio_push(const uint8_t *buf, size_t size);

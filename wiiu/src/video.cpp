@@ -176,13 +176,14 @@ static bool s_render_err_logged;
 // queda invalidar la caché de textura de la GPU y flipear: cero
 // memcpy, cero DCFlush. GX2 NO sale del hilo principal.
 //
-// SEGURIDAD DE PROPIEDAD: a las superficies de memoria de usuario JAMAS
-// se les llama GX2RDestroySurfaceEx (no poseen memoria — la posee el
-// backing, que es una superficie GX2R normal y SI se destruye). Asi el
-// codigo es correcto bajo cualquier semantica de Destroy. Si la
-// creacion falla o el backing trae alineacion < 1024 (lo que usa el
-// decoder) o UV no cae alineado, se cae a la copia CPU clasica con un
-// unico log: sin riesgo, con medible.
+// SEGURIDAD DE PROPIEDAD (gui-58): la memoria del camino directo es
+// NUESTRA — memalign(1024) en backing_create, con la alineacion que
+// exige el decoder garantizada por construccion (el pool GX2R no la
+// daba siempre: gui-57 cayo en0x1570d500 y el modo directo nunca
+// enganchaba). Ni el backing ni los pares poseen nada: a ninguno se
+// le llama GX2RDestroySurfaceEx, solo free() de la imagen. Si la
+// creacion falla o algo no cuadra, se cae a la copia CPU clasica con
+// un log: sin riesgo, con medible.
 static bool s_tex_usermem;       // los pares son memoria de usuario
 static GX2Texture s_bk[TEX_PAIRS];      // backings NV12 (poseen la mem)
 static bool s_bk_ready[TEX_PAIRS];
@@ -340,14 +341,13 @@ static void render_free()
 		s_tex_ready = false;
 		s_tex_w = s_tex_h = 0;
 	}
-	// Los backings poseen su memoria SIEMPRE (tanto en modo directo
-	// como si quedaron a medias de un intento fallido).
+	// Los backings son memoria de usuario (gui-58): la imagen es
+	// nuestra (memalign) — GX2RDestroySurfaceEx jamas, solo free.
 	for(int i = 0; i < TEX_PAIRS; i++)
 	{
 		if(s_bk_ready[i])
 		{
-			GX2RDestroySurfaceEx(&s_bk[i].surface,
-					     GX2R_RESOURCE_BIND_NONE);
+			free(s_bk_img[i]);
 			s_bk_ready[i] = false;
 			s_bk_img[i] = NULL;
 		}
@@ -556,35 +556,34 @@ static bool backing_create(int idx, int w, int h, GX2RResourceFlags flags)
 	bk->compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_1);
 	GX2CalcSurfaceSizeAndAlignment(&bk->surface);
 	GX2InitTextureRegs(bk);
-	if(!GX2RCreateSurface(&bk->surface, flags))
+	if(bk->surface.alignment > 1024)
 	{
-		vlog("Video HW: GX2RCreateSurface del backing fallo");
+		vlog("Video HW: backing pide alineacion de GPU %u >1024 — sin subida directa",
+		     (unsigned)bk->surface.alignment);
 		return false;
 	}
-	uint8_t *img =
-		(uint8_t *)GX2RLockSurfaceEx(&bk->surface, 0,
-					     GX2R_RESOURCE_BIND_NONE);
+	// Memoria propia con memalign(1024) (gui-58): la alineacion que
+	// exige el decoder queda garantizada por construccion. El pool
+	// GX2R no la daba siempre (gui-46/57: backing en 0x1570d500,
+	// offset256 -> sin subida directa). La superficie es de memoria
+	// de usuario y NO posee nada: la memoria es nuestra (free en
+	// render_free y en la limpieza del intento). UV = img + pitch*h
+	// cae alineado detras (pitch y h multiplos de 16 => producto
+	// multiplo de 256; con pitch 1024, de 1024).
+	uint8_t *img = (uint8_t *)memalign(1024, bk->surface.imageSize);
 	if(!img)
 	{
-		GX2RDestroySurfaceEx(&bk->surface, GX2R_RESOURCE_BIND_NONE);
-		vlog("Video HW: Lock del backing fallo");
+		vlog("Video HW: sin memoria para backing (%u bytes)",
+		     (unsigned)bk->surface.imageSize);
 		return false;
 	}
-	GX2RUnlockSurfaceEx(&bk->surface, 0, GX2R_RESOURCE_BIND_NONE);
-	// El requisito del GPU (surface.alignment) puede ser 256, pero lo
-	// que tiene que cumplir el DECODER es la alineacion del puntero
-	// que le damos (memalign 1024 en el framebuffer clasico). El pool
-	// GX2R reparte por paginas: el puntero suele venir a 4096 aunque
-	// el requisito sea 256. Se comprueba EL PUNTERO, no el requisito
-	// (gui-46 miro el requisito y desactivo la directa sin motivo).
-	// UV = img + pitch*h siempre queda 1024-alineado detras (pitch
-	// multiplo de 256 y h multiplo de 16 => producto multiplo de
-	// 4096), asi que basta chequear Y.
-	if((uintptr_t)img & 1023u)
+	// Gris NV12 neutro (Y=0x80, UV=0x80): si alguna ranura se
+	// flipeara sin escritura del decoder, no sale basura en pantalla.
+	memset(img, 0x80, bk->surface.imageSize);
+	if(!GX2RCreateSurfaceUserMemory(&bk->surface, img, NULL, flags))
 	{
-		vlog("Video HW: backing en %p no alineado a 1024 (lo pide el decoder) — sin subida directa",
-		     img);
-		GX2RDestroySurfaceEx(&bk->surface, GX2R_RESOURCE_BIND_NONE);
+		vlog("Video HW: GX2RCreateSurfaceUserMemory del backing fallo");
+		free(img);
 		return false;
 	}
 	s_bk_img[idx] = img;
@@ -617,14 +616,13 @@ static bool textures_alloc(int w, int h)
 		s_tex_ready = false;
 		s_tex_w = s_tex_h = 0;
 	}
-	// Los backings poseen su memoria SIEMPRE: se liberan aqui (y en
-	// render_free) aunque s_tex_ready este a 0.
+	// Los backings son memoria de usuario (gui-58): se liberan aqui
+	// (y en render_free) aunque s_tex_ready este a 0; solo free.
 	for(int i = 0; i < TEX_PAIRS; i++)
 	{
 		if(s_bk_ready[i])
 		{
-			GX2RDestroySurfaceEx(&s_bk[i].surface,
-					     GX2R_RESOURCE_BIND_NONE);
+			free(s_bk_img[i]);
 			s_bk_ready[i] = false;
 			s_bk_img[i] = NULL;
 		}
@@ -661,7 +659,7 @@ static bool textures_alloc(int w, int h)
 		vlog("Video HW: subida directa a textura activa (decoder->GX2R, sin memcpy)");
 	if(!direct)
 	{
-		// Limpieza del intento: backings SI (poseen su memoria),
+		// Limpieza del intento: backings de usuario (solo free),
 		// pares de usuario NO; structs a cero para no dejar
 		// superficies a medio crear en pie.
 		for(int i = 0; i < TEX_PAIRS; i++)
@@ -670,8 +668,7 @@ static bool textures_alloc(int w, int h)
 			memset(&s_tex_uv[i], 0, sizeof(s_tex_uv[i]));
 			if(s_bk_ready[i])
 			{
-				GX2RDestroySurfaceEx(&s_bk[i].surface,
-						     GX2R_RESOURCE_BIND_NONE);
+				free(s_bk_img[i]);
 				s_bk_ready[i] = false;
 				s_bk_img[i] = NULL;
 			}
