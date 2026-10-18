@@ -55,6 +55,10 @@ struct Config
 	// latencia, puede enseñar tearing). Se aplica al arrancar y al
 	// alternar la fila de Ajustes.
 	int vsync;
+	// Volumen de captura del micrófono en % (gui-67):0..200, default
+	// 100. Se ajusta con el slider que sale al mantener presionado el
+	// icono del micrófono durante la sesión.
+	int mic_gain_pct;
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
 

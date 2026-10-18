@@ -76,6 +76,10 @@
 #define ASSET_OFF_S 32             // icono off (off.svg), junto al disco
 #define ASSET_OFF_X (ASSET_DISC_X + ASSET_DISC_S)
 #define ASSET_OFF_Y ASSET_DISC_Y
+#define ASSET_MIC_S 32             // iconos de microfono (microphone*.svg)
+#define ASSET_MIC_X (ASSET_OFF_X + ASSET_OFF_S) // x192: micrófono activo
+#define ASSET_MIC_OFF_X (ASSET_MIC_X + ASSET_MIC_S) // x224: silenciado
+#define ASSET_MIC_Y ASSET_DISC_Y
 // Superficie del touchpad en la mitad IZQUIERDA: filas 136+ son virgenes
 // (los glifos acaban en la 127 y el bloque blanco ocupa 128-135).
 #define ASSET_TP_X 0
@@ -332,6 +336,19 @@ static bool font_create(void)
 	for(int r = 0; r < ASSET_OFF_S; r++)
 		memcpy(p + (size_t)(ASSET_OFF_Y + r) * pitch + ASSET_OFF_X,
 		       gui_off + (size_t)r * ASSET_OFF_S, ASSET_OFF_S);
+	// Iconos del micrófono en el hueco que queda en la fila y192
+	// (x192 y x224, hasta el borde del atlas de 256): activo y
+	// silenciado, igual que los demás assets R8.
+	for(int r = 0; r < ASSET_MIC_S; r++)
+	{
+		memcpy(p + (size_t)(ASSET_MIC_Y + r) * pitch + ASSET_MIC_X,
+		       gui_mic_mask + (size_t)r * ASSET_MIC_S,
+		       ASSET_MIC_S);
+		memcpy(p + (size_t)(ASSET_MIC_Y + r) * pitch +
+			       ASSET_MIC_OFF_X,
+		       gui_mic_off_mask + (size_t)r * ASSET_MIC_S,
+		       ASSET_MIC_S);
+	}
 	for(int r = 0; r < ASSET_TP_H; r++)
 		memcpy(p + (size_t)(ASSET_TP_Y + r) * pitch + ASSET_TP_X,
 		       gui_touchpad + (size_t)r * ASSET_TP_W, ASSET_TP_W);
@@ -626,6 +643,18 @@ void gui_asset_uvs(GuiAsset asset, float *u, float *v, float *w, float *h)
 		*v = (float)ASSET_OFF_Y / ah;
 		*w = (float)ASSET_OFF_S / aw;
 		*h = (float)ASSET_OFF_S / ah;
+		break;
+	case GUI_ASSET_MIC:
+		*u = (float)ASSET_MIC_X / aw;
+		*v = (float)ASSET_MIC_Y / ah;
+		*w = (float)ASSET_MIC_S / aw;
+		*h = (float)ASSET_MIC_S / ah;
+		break;
+	case GUI_ASSET_MIC_SLASH:
+		*u = (float)ASSET_MIC_OFF_X / aw;
+		*v = (float)ASSET_MIC_Y / ah;
+		*w = (float)ASSET_MIC_S / aw;
+		*h = (float)ASSET_MIC_S / ah;
 		break;
 	case GUI_ASSET_TOUCHPAD:
 		*u = (float)ASSET_TP_X / aw;

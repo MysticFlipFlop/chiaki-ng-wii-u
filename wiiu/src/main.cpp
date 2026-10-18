@@ -24,7 +24,9 @@
  *       (fase 3c) el mando va al juego: layout por posicion fisica
  *       (B=cross, A=circulo, Y=cuadrado, X=triangulo; ZL/ZR=L2/R2,
  *       MINUS=boton PS, PLUS=options) y la sesion se para tocando el
- *       icono de apagado de la esquina inferior derecha.
+ *       icono de apagado de la esquina inferior derecha. El icono de
+ *       micrófono de la esquina inferior izquierda activa o silencia el
+ *       micrófono del GamePad: toda sesión arranca silenciado.
  *
  * Los resultados van a la consola cafe (OSReport -> log de Cemu), al
  * UDP 4405 y al archivo de la SD (fs:/vol/external01/wiiu/apps/chiaki/
@@ -46,6 +48,7 @@
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/mutex.h>
 #include <sndcore2/core.h>
+#include <mic/mic.h> // mic.rpl: micrófono interno del GamePad (gui-67)
 #include <nn/swkbd.h>
 
 #include <chiaki/log.h>
@@ -57,10 +60,13 @@
 #include <chiaki/controller.h>
 #include <chiaki/base64.h>
 #include <chiaki/opusdecoder.h>
+#include <chiaki/opusencoder.h> // mic: opus de subida por takion
+#include <chiaki/audio.h> // chiaki_audio_header_set (cabecera del mic)
 
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <malloc.h> // memalign (anillo del micrófono, alineado 0x40)
 #include <cstring>
 
 #include "video.h"
@@ -191,6 +197,11 @@ static uint64_t g_video_log_iters = 0;
 // toques). El TOQUE del touchpad NO usa antirrebote de input — rompia
 // clicks y arrastres (gui-63); su rebote se oculta en lo visual.
 #define TP_REBIND_MS 80
+// Brillo animado del surface (gui-69): el dedo encima aclara con
+// fundido corto y al soltar se recoloca también con fundido — sin el
+// retardo de 250 ms que dejaba el surface "encendido" tras el dedo.
+#define TP_TOUCH_FADE_IN_MS 80
+#define TP_TOUCH_FADE_OUT_MS 150
 static bool g_tp_down = false;      // contacto vigente en la zona
 static uint16_t g_tp_x = 0;         // pos mapeada al pad (x)
 static uint16_t g_tp_y = 0;         // pos mapeada al pad (y)
@@ -203,9 +214,12 @@ static float g_tp_ax = 0.0f;       // punto estable que sigue la salida (x)
 static float g_tp_ay = 0.0f;       // punto estable que sigue la salida (y)
 static uint64_t g_tp_down_ticks = 0; // instante del contacto (tap)
 // Telemetria de tactil (gui-64): rebotes y picos del sensor en la
-// zona del touchpad, resumidos cada 3 s en el log. g_tp_touch_t es
-// ademas el ultimo contacto visto (anti-parpadeo visual del surface).
-static uint64_t g_tp_touch_t = 0;
+// zona del touchpad, resumidos cada 3 s en el log.
+// Brillo animado del surface (gui-69): amount 0..1 hacia el estado
+// "dedo encima"; el dibujo del surface avanza la animación una vez
+// por frame (solo se dibuja en la pasada DRC).
+static uint64_t g_tp_touch_draw_t = 0; // último avance de la animación
+static float g_tp_touch_amt = 0.0f;    // 0 = reposo, 1 = tocado
 static uint32_t g_touch_begins = 0;  // contactos iniciados en la zona
 static uint32_t g_touch_ends = 0;    // soltadas confirmadas
 static uint32_t g_touch_spikes = 0;  // frames con salto >12 px
@@ -213,6 +227,21 @@ static uint32_t g_touch_maxjump = 0; // mayor salto por frame (px zona)
 static int g_touch_last_lx = 0;      // pos cruda previa (x)
 static int g_touch_last_ly = 0;      // pos cruda previa (y)
 static uint64_t g_tp_click_ticks = 0; // deadline del pulso de click
+// Gusano de luz del touchpad (gui-72): estela blanca que sigue el dedo
+// y se atenúa al deslizar (la cola se apaga por edad y al soltar todo
+// se disuelve con fundido); la cabeza destella al tocar. Solo DRC; se
+// muestrea g_tp_ax/ay una vez por frame en draw_touchpad.
+#define TP_WORM_PTS 28        // memoria de la estela (~1,1 s de muestras)
+#define TP_WORM_TTL_MS 350    // vida de cada punto de la estela
+#define TP_WORM_LIFT_MS 400   // disolución tras soltar (petición)
+#define TP_WORM_FLASH_MS 150  // destello del anillo al tocar
+static float tp_worm_x[TP_WORM_PTS];     // estela en px de zona (x)
+static float tp_worm_y[TP_WORM_PTS];     // estela en px de zona (y)
+static uint64_t tp_worm_t[TP_WORM_PTS];  // instante de cada muestra
+static int tp_worm_n = 0;        // muestras válidas (la cabeza es n-1)
+static bool tp_worm_prev = false;    // contacto en el frame anterior
+static uint64_t tp_worm_flash_t = 0; // inicio del destello (0 = off)
+static float tp_worm_fade = 1.0f;    // 1 = completo, 0 = disuelto
 static bool g_tp_diag = false;      // primer contacto de sesion logueado
 // Surface transitorio: visible solo hasta esta deadline (2 s tras el
 // primer frame de stream, y mientras tocas + 2 s tras soltar).
@@ -1427,6 +1456,243 @@ static const char *video_preset_label(int idx)
 		.label;
 }
 
+// ---------------------------------------------------------------------------
+// Micrófono del GamePad (gui-67). La DRC trae un micrófono interno que se
+// captura con mic.rpl (MICInit/MICOpen/MICGetStatus/MICSetDataConsumed),
+// fijo a 32 kHz mono s16 (tasa confirmable con MICGetState(0, ...), que
+// es además lo que emula Cemu — se puede probar allí primero). El envío a
+// la PS4 reutiliza el camino del cliente Qt: por cada frame de 480
+// muestras (10 ms @ 48 kHz estéreo) el encoder opus de chiaki lo
+// empaqueta y lo manda por takion — chiaki_opus_encoder_frame() lo hace
+// solo, igual que en StreamSession::ReadMic. La conversión 32k→48k es
+// interpolación lineal con fase persistente (ratio limpio:320 muestras
+// de entrada producen exactamente480 de salida) y el mono se duplica a
+// los dos canales. v1 sin eco-cancelación: el procesado de voz lo hace
+// la propia PS4 (parties/chats).
+#define MIC_SAMPLE_MAX 0x2800 // mínimo que exige MICWorkMemory (anillo)
+#define MIC_RATE_OUT 48000    // tasa de la cabecera del mic (opus OK)
+#define MIC_FRAME_SAMPLES 480 // frame chiaki: 10 ms @ 48 kHz
+#define MIC_SLIDER_FADE_IN_MS 180  // fundido de aparición del slider
+#define MIC_SLIDER_FADE_OUT_MS 200 // fundido de cierre del slider
+#define MIC_GAIN_STEP_PCT 25       // saltos de 25 en 25 (petición gui-69)
+
+static bool g_mic_wanted = false;   // estado del icono (arranca apagado)
+static bool g_mic_muted = true;     // estado del mute reportado a chiaki
+static bool g_mic_enc_inited = false;
+static bool g_mic_connected = false; // connect_microphone ya enviado
+static bool g_mic_hw_open = false;   // MICInit + MICOpen hechos
+static MICHandle g_mic_handle = -1;
+static void *g_mic_ring = nullptr; // sampleBuffer alineado a 0x40
+static ChiakiOpusEncoder g_mic_enc;
+static int16_t g_mic_frame[MIC_FRAME_SAMPLES * 2]; // frame estéreo listo
+static int g_mic_frame_fill = 0;  // muestras (pares) del frame en curso
+static uint32_t g_mic_rate_in = MIC_RATE_OUT; // tasa que reporta el OS
+static double g_mic_step = 0.0;   // muestras de entrada por salida
+static double g_mic_phase = 0.0;  // fracción entre prev y la entrada
+static int16_t g_mic_prev = 0;    // última muestra de entrada leída
+static bool g_mic_have_prev = false;
+static uint32_t g_mic_consumed_win = 0; // entradas en la ventana de3 s
+static int g_mic_peak_win = 0;          // pico |muestra| de la ventana
+// Slider de volumen por presión larga sobre el icono (gui-67): la pista
+// sale justo arriba; el valor vive en config (mic_gain_pct,0..200) para
+// que persista entre sesiones. El gain se aplica en software en
+// mic_push_input con saturación — así funciona igual en hardware y en
+// Cemu, sin depender del rango real de MICSetState(GAIN_DB).
+static bool g_mic_slider_open = false;
+static bool g_mic_drag = false;       // dedo arrastrando la pista
+static bool g_mic_hold_fired = false; // pulsación larga ya consumida
+static uint64_t g_mic_hold_t0 = 0; // inicio de la pulsación en el icono
+// Transición visual (gui-67): el slider entra y sale con fundido. El
+// estado lógico (open) manda la interacción; el alpha manda el dibujo,
+// que continúa durante el cierre hasta llegar a cero.
+static float g_mic_slider_alpha = 0.0f;
+static uint64_t g_mic_slider_draw_t = 0; // último avance de la animación
+
+// Abre el micrófono de la DRC (instancia0 = GamePad principal).
+static bool mic_hw_open(void)
+{
+	if(g_mic_hw_open)
+		return true;
+	g_mic_ring = memalign(0x40, MIC_SAMPLE_MAX * sizeof(int16_t));
+	if(!g_mic_ring)
+	{
+		logprintf("Mic: sin memoria para el anillo (%u bytes)",
+			  (unsigned)(MIC_SAMPLE_MAX * sizeof(int16_t)));
+		return false;
+	}
+	MICWorkMemory wm;
+	wm.sampleMaxCount = MIC_SAMPLE_MAX;
+	wm.sampleBuffer = g_mic_ring;
+	MICError werr = MIC_ERROR_OK;
+	g_mic_handle = MICInit(MIC_INSTANCE_0, 0, &wm, &werr);
+	if(g_mic_handle < 0 || werr != MIC_ERROR_OK)
+	{
+		logprintf("Mic: MICInit fallo (handle=%d err=%d)",
+			  g_mic_handle, (int)werr);
+		free(g_mic_ring);
+		g_mic_ring = nullptr;
+		g_mic_handle = -1;
+		return false;
+	}
+	MICError err = MICOpen(g_mic_handle);
+	if(err != MIC_ERROR_OK)
+	{
+		logprintf("Mic: MICOpen fallo (err=%d)", (int)err);
+		MICUninit(g_mic_handle);
+		free(g_mic_ring);
+		g_mic_ring = nullptr;
+		g_mic_handle = -1;
+		return false;
+	}
+	// Tasa real que reporta la librería del sistema (32 kHz en hardware
+	// y en Cemu); de ella depende el paso del resample.
+	uint32_t rate = 0;
+	if(MICGetState(g_mic_handle, 0 /* SAMPLERATE */, &rate) ==
+		   MIC_ERROR_OK &&
+	   rate)
+		g_mic_rate_in = rate;
+	g_mic_step = (double)g_mic_rate_in / (double)MIC_RATE_OUT;
+	g_mic_hw_open = true;
+	g_mic_frame_fill = 0;
+	g_mic_phase = 0.0;
+	g_mic_have_prev = false;
+	logprintf("Mic: abierto (%u Hz mono s16, paso %.4f)",
+		  (unsigned)g_mic_rate_in, g_mic_step);
+	return true;
+}
+
+static void mic_hw_close(void)
+{
+	if(!g_mic_hw_open)
+		return;
+	MICClose(g_mic_handle);
+	MICUninit(g_mic_handle);
+	g_mic_handle = -1;
+	free(g_mic_ring);
+	g_mic_ring = nullptr;
+	g_mic_hw_open = false;
+	g_mic_frame_fill = 0;
+	g_mic_phase = 0.0;
+	g_mic_have_prev = false;
+}
+
+// Limpieza de fin de sesión: el sender del encoder apunta al session, así
+// que hay que liberarlo ANTES de chiaki_session_fini (igual que el
+// decoder de audio de salida).
+static void mic_session_fini(void)
+{
+	if(g_mic_enc_inited)
+	{
+		chiaki_opus_encoder_fini(&g_mic_enc);
+		g_mic_enc_inited = false;
+	}
+	mic_hw_close();
+	g_mic_connected = false;
+	g_mic_wanted = false;
+	g_mic_muted = true;
+	g_mic_consumed_win = 0;
+	g_mic_peak_win = 0;
+	g_mic_slider_open = false;
+	g_mic_drag = false;
+	g_mic_hold_fired = false;
+	g_mic_slider_alpha = 0.0f;
+	g_mic_slider_draw_t = 0;
+}
+
+// Acumula una tanda de muestras mono rellenando g_mic_frame estéreo
+// (canal duplicado); al completarse los480 se entrega al encoder opus,
+// que lo empaqueta y manda por takion. Resample lineal con fase
+// persistente: con el paso del sistema (2/3 a32 kHz)320 muestras de
+// entrada producen exactamente480 de salida —10 ms de frame.
+static void mic_push_input(const int16_t *src, int n)
+{
+	for(int i = 0; i < n; i++)
+	{
+		int16_t x = src[i];
+		if(!g_mic_have_prev)
+		{
+			g_mic_prev = x;
+			g_mic_have_prev = true;
+		}
+		while(g_mic_phase < 1.0)
+		{
+			double s = (1.0 - g_mic_phase) * (double)g_mic_prev +
+				   g_mic_phase * (double)x;
+			// Volumen de captura (slider del icono): gain en
+			// software con saturación a int16 — la telemetría
+			// de peak sigue midiendo la señal EN CRUDO.
+			s = s * ((double)g_config.mic_gain_pct / 100.0);
+			if(s > 32767.0)
+				s = 32767.0;
+			else if(s < -32768.0)
+				s = -32768.0;
+			int16_t v = (int16_t)s;
+			g_mic_frame[g_mic_frame_fill++] = v;
+			g_mic_frame[g_mic_frame_fill++] = v;
+			if(g_mic_frame_fill == MIC_FRAME_SAMPLES * 2)
+			{
+				g_mic_frame_fill = 0;
+				if(g_mic_connected && !g_mic_muted)
+					chiaki_opus_encoder_frame(
+						g_mic_frame, &g_mic_enc);
+			}
+			g_mic_phase += g_mic_step;
+		}
+		g_mic_phase -= 1.0;
+		g_mic_prev = x;
+	}
+}
+
+// Drena el anillo MIC una vez por vuelta del bucle (fuera de los pases
+// TV/DRC). Consume SIEMPRE las muestras aunque esté silenciado, para que
+// no se desborde el anillo del sistema; solo se codifica si el mic está
+// activo y conectado.
+static void mic_poll(void)
+{
+	if(!g_mic_hw_open)
+		return;
+	MICStatus st;
+	if(MICGetStatus(g_mic_handle, &st) != MIC_ERROR_OK ||
+	   st.availableData <= 0)
+		return;
+	int avail = st.availableData;
+	if(avail > MIC_SAMPLE_MAX)
+		avail = MIC_SAMPLE_MAX; // defensa: nunca más que el anillo
+	// bufferPos (wut) = readIndex del anillo (semántica de Cemu y de
+	// wiiubrew): la copia empieza ahí y puede dar la vuelta.
+	int idx = st.bufferPos % MIC_SAMPLE_MAX;
+	const int16_t *ring = (const int16_t *)g_mic_ring;
+	int first = MIC_SAMPLE_MAX - idx;
+	if(first > avail)
+		first = avail;
+	// Pico absoluto de la ventana (diagnóstico de nivel en log.txt).
+	for(int i = 0; i < first; i++)
+	{
+		int v = ring[idx + i];
+		if(v < 0)
+			v = -v;
+		if(v > g_mic_peak_win)
+			g_mic_peak_win = v;
+	}
+	mic_push_input(ring + idx, first);
+	if(avail > first)
+	{
+		for(int i = 0; i < avail - first; i++)
+		{
+			int v = ring[i];
+			if(v < 0)
+				v = -v;
+			if(v > g_mic_peak_win)
+				g_mic_peak_win = v;
+		}
+		mic_push_input(ring, avail - first);
+	}
+	// Consumir DESPUÉS de copiar: la memoria sigue siendo nuestra
+	// mientras leemos, y el OS ya puede reescribir lo consumido.
+	MICSetDataConsumed(g_mic_handle, avail);
+	g_mic_consumed_win += (uint32_t)avail;
+}
+
 static bool start_session()
 {
 	if(!g_host_found && !g_host_ip[0])
@@ -1541,6 +1807,21 @@ static bool start_session()
 	g_fec_failures = 0;
 	g_video_log_ticks = OSGetTime();
 	g_video_log_frames = 0;
+	// Micrófono (gui-67): toda sesión arranca con el icono en
+	// silenciado; el hardware y el encoder se cierran en la parada.
+	g_mic_wanted = false;
+	g_mic_muted = true;
+	g_mic_connected = false;
+	g_mic_frame_fill = 0;
+	g_mic_phase = 0.0;
+	g_mic_have_prev = false;
+	g_mic_consumed_win = 0;
+	g_mic_peak_win = 0;
+	g_mic_slider_open = false;
+	g_mic_drag = false;
+	g_mic_hold_fired = false;
+	g_mic_slider_alpha = 0.0f;
+	g_mic_slider_draw_t = 0;
 	// Detector de estancamiento del decoder: ventana desde el arranque.
 	{
 		uint64_t now = OSGetTime();
@@ -1556,7 +1837,7 @@ static bool start_session()
 	snprintf(g_config.last_host, sizeof(g_config.last_host), "%s", host);
 	chiaki_mutex_unlock(&g_host_mutex);
 	g_config_dirty = true;
-	logprintf("Sesion: thread en marcha (↑ registra | A conecta | B cancela al conectar | icono abajo dcha = parar)");
+	logprintf("Sesion: thread en marcha (↑ registra | A conecta | B cancela al conectar | icono abajo dcha = parar | mic abajo izq = micro)");
 	return true;
 }
 
@@ -1567,6 +1848,9 @@ static void stop_session(bool shutdown = false)
 	logprintf("Sesion: parando...");
 	chiaki_session_stop(&g_session);
 	chiaki_session_join(&g_session);
+	// Micrófono: cierra MIC* y libera el sender del encoder mientras el
+	// session sigue vivo (el sender apunta a él).
+	mic_session_fini();
 	chiaki_session_fini(&g_session);
 	// El hilo de sesión ya está unido: nadie entrega más opus. Libera
 	// el decoder (pcm_buf + opus) y silencia la voz AX.
@@ -2023,7 +2307,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-66"
+#define APP_BUILD_TAG "gui-72"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2132,6 +2416,187 @@ static void draw_stop_button(int w, int h)
 	gui_flush();
 }
 
+// Alterna el micrófono (silenciado <-> activo). La primera activación
+// abre el hardware, declara el formato al session (2ch/16b/48k/480, igual
+// que el cliente Qt) y manda connect_microphone; los toggles siguientes
+// solo mandan el mensaje de mute. Mismo orden que StreamSession::ToggleMute.
+static void mic_toggle(void)
+{
+	g_mic_wanted = !g_mic_wanted;
+	if(g_mic_wanted)
+	{
+		if(!mic_hw_open())
+		{
+			g_mic_wanted = false;
+			return;
+		}
+		if(!g_mic_connected)
+		{
+			if(!g_mic_enc_inited)
+			{
+				chiaki_opus_encoder_init(&g_mic_enc,
+							 &g_chiaki_log);
+				g_mic_enc_inited = true;
+			}
+			ChiakiAudioHeader hdr;
+			chiaki_audio_header_set(&hdr, 2, 16, MIC_RATE_OUT,
+						MIC_FRAME_SAMPLES);
+			chiaki_opus_encoder_header(&hdr, &g_mic_enc,
+						   &g_session);
+			ChiakiErrorCode err =
+				chiaki_session_connect_microphone(&g_session);
+			if(err != CHIAKI_ERR_SUCCESS)
+			{
+				logprintf(
+					"Mic: connect_microphone fallo (%d)",
+					(int)err);
+				g_mic_wanted = false;
+				return;
+			}
+			g_mic_connected = true;
+		}
+		// g_mic_muted arranca en true: el primer toggle manda
+		// "unmute" (el argumento es el estado previo) y queda activo.
+		chiaki_session_toggle_microphone(&g_session, g_mic_muted);
+		g_mic_muted = false;
+		g_mic_frame_fill = 0;
+		logprintf("Mic: activado");
+	}
+	else
+	{
+		if(g_mic_connected)
+		{
+			chiaki_session_toggle_microphone(&g_session,
+							 g_mic_muted);
+			g_mic_muted = true;
+		}
+		g_mic_frame_fill = 0;
+		logprintf("Mic: silenciado");
+	}
+}
+
+// Rect del icono del micrófono: la misma caja que la de parada, reflejada
+// en X (esquina inferior izquierda; visible también en la TV, toquitable
+// solo en el DRC).
+static void mic_button_rect(int w, int h, int *x, int *y, int *d)
+{
+	stop_button_rect(w, h, x, y, d);
+	*x = w - *x - *d;
+}
+
+// Pista vertical del slider: centrada sobre el icono con un hueco de u,
+// tamaño contenido (u*2 x u*12 = 16x96 px en la DRC — "no tan grande")
+// y margen de dedo (mpad=16) en el toque. Arriba = volumen máximo,
+// abajo = 0.
+static void mic_slider_rect(int w, int h, int *x, int *y, int *rw, int *rh)
+{
+	int bx, by, bd;
+	mic_button_rect(w, h, &bx, &by, &bd);
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	*rw = u * 2;
+	*rh = u * 12;
+	*x = bx + (bd - *rw) / 2;
+	*y = by - u - *rh;
+}
+
+// Icono del micrófono (solo con sesión activa): el mismo disco que el de
+// parada, con el glifo del micrófono a media caja (más pequeño que el de
+// parada) y blanco en los dos estados — el estado se lee en la propia
+// silueta: tachado = silenciado (arranque de toda sesión), limpio = activo.
+static void draw_mic_button(int w, int h)
+{
+	int x, y, d;
+	mic_button_rect(w, h, &x, &y, &d);
+
+	float du, dv, dw, dh;
+	gui_asset_uvs(GUI_ASSET_DISC, &du, &dv, &dw, &dh);
+	float mu, mv, mw, mh;
+	gui_asset_uvs(g_mic_wanted ? GUI_ASSET_MIC : GUI_ASSET_MIC_SLASH,
+		      &mu, &mv, &mw, &mh);
+
+	gui_begin(w, h);
+	gui_image((float)x, (float)y, (float)d, (float)d, du, dv, dw, dh,
+		  GUI_RGBA(0x00, 0x00, 0x00, 0xb3));
+	// Glifo a media caja (petición gui-67: un poco más pequeño que
+	// la primera versión a dos tercios; el disco no cambia) y
+	// blanco fijo en los dos estados.
+	int g = d / 2;
+	gui_image((float)(x + (d - g) / 2), (float)(y + (d - g) / 2),
+		  (float)g, (float)g, mu, mv, mw, mh,
+		  GUI_RGBA(0xff, 0xff, 0xff, 0xe6));
+	// Slider de volumen (presión larga sobre el icono): pista
+	// delgada justo arriba con tramo lleno desde abajo hasta la
+	// pinza, y el porcentaje a la derecha (a la izquierda se salía
+	// del borde de la pantalla). El du/dv siguen siendo los del
+	// disco (se asignaron arriba) para la pinza. Transición (gui-67):
+	// entra y sale con fundido — el alpha sigue avanzando en el
+	// dibujo aunque la interacción ya esté cerrada.
+	{
+		uint64_t nows = OSGetTime();
+		float dts = (float)((nows - g_mic_slider_draw_t) /
+				    OSMillisecondsToTicks(1));
+		g_mic_slider_draw_t = nows;
+		if(dts > 50.0f)
+			dts = 50.0f; // frame atascado: no salta de golpe
+		float target = g_mic_slider_open ? 1.0f : 0.0f;
+		if(g_mic_slider_alpha < target)
+		{
+			g_mic_slider_alpha +=
+				dts / (float)MIC_SLIDER_FADE_IN_MS;
+			if(g_mic_slider_alpha > target)
+				g_mic_slider_alpha = target;
+		}
+		else if(g_mic_slider_alpha > target)
+		{
+			g_mic_slider_alpha -=
+				dts / (float)MIC_SLIDER_FADE_OUT_MS;
+			if(g_mic_slider_alpha < target)
+				g_mic_slider_alpha = target;
+		}
+		float al = g_mic_slider_alpha;
+		if(g_mic_slider_open || al > 0.0f)
+		{
+			int slx, sly, slw, slh;
+			mic_slider_rect(w, h, &slx, &sly, &slw, &slh);
+			int pct = g_config.mic_gain_pct;
+			float ky = (float)sly +
+				   (1.0f - (float)pct / 200.0f) *
+					   (float)slh;
+			gui_rect((float)slx, (float)sly, (float)slw,
+				 (float)slh,
+				 GUI_RGBA(0x00, 0x00, 0x00,
+					  (uint32_t)(al * (float)0xb3 +
+						     0.5f)));
+			if((float)(sly + slh) - ky > 0.5f)
+				gui_rect((float)slx, ky, (float)slw,
+					 (float)(sly + slh) - ky,
+					 GUI_RGBA(0xff, 0xff, 0xff,
+						  (uint32_t)(al * (float)0x80 +
+							     0.5f)));
+			float kw = (float)slw;
+			gui_image((float)slx, ky - kw * 0.5f, kw, kw, du, dv,
+				  dw, dh,
+				  GUI_RGBA(0xff, 0xff, 0xff,
+					   (uint32_t)(al * (float)0xe6 +
+						      0.5f)));
+			char pct_s[8];
+			snprintf(pct_s, sizeof(pct_s), "%d%%", pct);
+			int u8 = (w >= 1280) ? 16 : 8;
+			// A la derecha de la pista: a la izquierda el
+			// texto se salía del borde de la pantalla (gui-67).
+			gui_text((float)(slx + slw + u8),
+				 (float)sly + (float)slh * 0.5f - 4.0f,
+				 pct_s,
+				 GUI_RGBA(0xff, 0xff, 0xff,
+					  (uint32_t)(al * (float)0xe6 +
+						     0.5f)),
+				 1);
+		}
+	}
+	gui_flush();
+}
+
 // Superficie del touchpad (solo en sesion): redondeada (mascara del
 // SVG) y se aclara mientras hay un contacto encima.
 static void draw_touchpad(int w, int h)
@@ -2158,22 +2623,188 @@ static void draw_touchpad(int w, int h)
 	// azulado oscuro. Con dedo encima se aclara a gris medio para
 	// localizar el toque. El alpha se multiplica por el fundido de
 	// salida.
-	// Dedo "encima" con histéresis visual (gui-64): el tactil de la
-	// DRC rebota al apretar y con el contacto a un frame el surface
-	// parpadeaba — el brillo se mantiene 250 ms tras el ultimo
-	// contacto aunque el input vea el rebote.
-	bool near_touch =
-		g_tp_down ||
-		OSGetTime() - g_tp_touch_t < OSMillisecondsToTicks(250);
-	// En reposo: plateado casi transparente (gui-66) — solo se
-	// intuye sobre el juego. Con el dedo encima, gris solido.
-	uint32_t col = near_touch ? GUI_RGBA(0x94, 0x94, 0x94, 0)
-				 : GUI_RGBA(0xc8, 0xcc, 0xd4, 0);
-	uint32_t a = (uint32_t)((near_touch ? 0xbf : 0x40) * fade + 0.5f);
+	// Dedo encima con transición animada (gui-69): antes un
+	// histéresis de 250 ms dejaba el surface encendido un rato
+	// tras soltar; ahora el amount sigue al contacto real (g_tp_down)
+	// con fundido corto en ambas direcciones — el propio fundido
+	// enmascara el micro-rebote del táctil y nada queda iluminado
+	// tras el dedo.
+	uint64_t nows = OSGetTime();
+	float dts = (float)((nows - g_tp_touch_draw_t) /
+			    OSMillisecondsToTicks(1));
+	g_tp_touch_draw_t = nows;
+	if(dts > 50.0f)
+		dts = 50.0f; // frame atascado: no salta de golpe
+	float ttarget = g_tp_down ? 1.0f : 0.0f;
+	if(g_tp_touch_amt < ttarget)
+	{
+		g_tp_touch_amt += dts / (float)TP_TOUCH_FADE_IN_MS;
+		if(g_tp_touch_amt > ttarget)
+			g_tp_touch_amt = ttarget;
+	}
+	else if(g_tp_touch_amt > ttarget)
+	{
+		g_tp_touch_amt -= dts / (float)TP_TOUCH_FADE_OUT_MS;
+		if(g_tp_touch_amt < ttarget)
+			g_tp_touch_amt = ttarget;
+	}
+	// Mezcla continua entre reposo (plateado casi transparente,
+	// gui-66 — solo se intuye sobre el juego) y tocado (gris solido
+	// para localizar el toque).
+	float amt = g_tp_touch_amt;
+	uint32_t cr = (uint32_t)(0xc8 + (0x94 - 0xc8) * amt + 0.5f);
+	uint32_t cg = (uint32_t)(0xcc + (0x94 - 0xcc) * amt + 0.5f);
+	uint32_t cb = (uint32_t)(0xd4 + (0x94 - 0xd4) * amt + 0.5f);
+	uint32_t col = (cr << 24) | (cg << 16) | (cb << 8);
+	uint32_t a =
+		(uint32_t)((0x40 + (0xbf - 0x40) * amt) * fade + 0.5f);
 	// (Con la codificacion BE de GUI_RGBA el alfa va en el byte bajo:
 	// col lleva a=0 y el fundido se OR-ea encima.)
+	uint32_t c = (col & 0xffffff00u) | a;
 	gui_image((float)x, (float)y, (float)rw, (float)rh, tu, tv, tw, th,
-		  col | a);
+		  c);
+	// --- Gusano de luz (gui-72): solo estela blanca ---
+	// La estela sigue la posición estable del contacto; se alimenta
+	// una vez por frame y sus puntos mueren por edad, así la cola se
+	// apaga al deslizar y todo se disuelve al soltar (~0,4 s). La
+	// cabeza destella al tocar (sin anillo: el feedback del toque
+	// vive en la propia estela).
+	{
+		float gu, gv, gw, gh;
+		gui_asset_uvs(GUI_ASSET_DISC, &gu, &gv, &gw, &gh);
+		if(g_tp_down)
+		{
+			// Muestreo: solo si el dedo se movió (quieto = la
+			// estela envejece y se apaga sola bajo el anillo).
+			if(tp_worm_n > 0)
+			{
+				float dx = g_tp_ax - tp_worm_x[tp_worm_n - 1];
+				float dy = g_tp_ay - tp_worm_y[tp_worm_n - 1];
+				if(dx * dx + dy * dy >= 4.0f) // ≥ 2 px zona
+				{
+					if(tp_worm_n == TP_WORM_PTS)
+					{
+						memmove(tp_worm_x,
+							tp_worm_x + 1,
+							sizeof(tp_worm_x[0]) *
+								(TP_WORM_PTS - 1));
+						memmove(tp_worm_y,
+							tp_worm_y + 1,
+							sizeof(tp_worm_y[0]) *
+								(TP_WORM_PTS - 1));
+						memmove(tp_worm_t,
+							tp_worm_t + 1,
+							sizeof(tp_worm_t[0]) *
+								(TP_WORM_PTS - 1));
+						tp_worm_n--;
+					}
+					tp_worm_x[tp_worm_n] = g_tp_ax;
+					tp_worm_y[tp_worm_n] = g_tp_ay;
+					tp_worm_t[tp_worm_n] = nows;
+					tp_worm_n++;
+				}
+			}
+			else
+			{
+				tp_worm_x[0] = g_tp_ax;
+				tp_worm_y[0] = g_tp_ay;
+				tp_worm_t[0] = nows;
+				tp_worm_n = 1;
+			}
+			tp_worm_fade = 1.0f;
+		}
+		else if(tp_worm_n > 0)
+		{
+			// Disolución tras soltar; los puntos siguen muriendo
+			// por edad mientras tanto.
+			tp_worm_fade -= dts / (float)TP_WORM_LIFT_MS;
+			if(tp_worm_fade <= 0.0f)
+			{
+				tp_worm_fade = 0.0f;
+				tp_worm_n = 0;
+			}
+		}
+		// Destello: pulso del anillo al pasar a contacto nuevo.
+		if(g_tp_down && !tp_worm_prev)
+			tp_worm_flash_t = nows;
+		tp_worm_prev = g_tp_down;
+
+		if(tp_worm_n > 0 && tp_worm_fade > 0.0f)
+		{
+			// g_tp_ax/ay ya viene en px de la zona (854), igual
+			// que el rect del panel: mapeo 1:1 con la pantalla,
+			// sin escalado (gui-71: antes se reescalaba como si
+			// fuese 850x480 y el gusano quedaba diminuto y
+			// arrinconado en una esquina).
+			float wa = tp_worm_fade * fade;
+			// Destello: al tocar, la cabeza de la estela pulsa
+			// más ancha y brillante ~150 ms (gui-72: sin anillo,
+			// el feedback del toque vive en la propia estela).
+			float fl = 0.0f;
+			if(tp_worm_flash_t != 0)
+			{
+				fl = 1.0f - (float)(nows - tp_worm_flash_t) /
+					    (float)OSMillisecondsToTicks(
+						    TP_WORM_FLASH_MS);
+				if(fl <= 0.0f)
+				{
+					fl = 0.0f;
+					tp_worm_flash_t = 0;
+				}
+			}
+			// Estela: discos interpolados entre muestras (sin
+			// huecos a alta velocidad) con radio y alfa cayendo
+			// hacia la cola; la edad apaga cada punto por su
+			// cuenta.
+			for(int i = 0; i < tp_worm_n; i++)
+			{
+				float ax = tp_worm_x[i], ay = tp_worm_y[i];
+				float bx = ax, by = ay;
+				int steps = 1;
+				if(i > 0)
+				{
+					bx = tp_worm_x[i - 1];
+					by = tp_worm_y[i - 1];
+					float ddx = ax - bx;
+					float ddy = ay - by;
+					if(ddx < 0.0f)
+						ddx = -ddx;
+					if(ddy < 0.0f)
+						ddy = -ddy;
+					steps = (int)((ddx + ddy) / 3.0f) + 1;
+				}
+				float age = (float)(nows - tp_worm_t[i]) /
+					    (float)OSMillisecondsToTicks(
+						    TP_WORM_TTL_MS);
+				if(age >= 1.0f)
+					continue;
+				float tr = 1.0f - age;
+				for(int s = 0; s < steps; s++)
+				{
+					float t = (float)s / (float)steps;
+					float pxx = bx + (ax - bx) * t;
+					float pyy = by + (ay - by) * t;
+					float back = ((float)(i + 1) - t) /
+						     (float)tp_worm_n;
+					float rad = (2.0f + 4.0f * back) * tr *
+						     (1.0f + 0.45f * fl * back);
+					float aa = 0.5f * back * tr * tr +
+						   0.25f * fl * back * back;
+					if(aa < 0.012f)
+						continue;
+					float sx = x + pxx;
+					float sy = y + pyy;
+					gui_image(sx - rad, sy - rad,
+						  rad * 2.0f, rad * 2.0f,
+						  gu, gv, gw, gh,
+						  GUI_RGBA(0xff, 0xff, 0xff,
+							   (uint32_t)(aa * wa *
+									  255.0f +
+								  0.5f)));
+				}
+			}
+		}
+	}
 	gui_flush();
 }
 
@@ -2931,6 +3562,13 @@ int main(int argc, char **argv)
 	VPADTouchData last_touch = {};
 	// Icono de parada táctil: transicion del ultimo toque en la caja.
 	bool stop_touch_prev = false;
+	// Icono del micrófono (gui-67): prev del interior para el flanco
+	// de soltado, contacto previo para detectar el press-edge y la
+	// pulsación en curso para separar toque (alternar) de presión
+	// larga (slider de volumen).
+	bool mic_touch_prev = false;
+	bool mic_was_touched = false;
+	bool mic_press_on_icon = false;
 
 	while(WHBProcIsRunning())
 	{
@@ -3321,7 +3959,6 @@ int main(int argc, char **argv)
 					int lx = (int)tp.x - zx, ly = (int)tp.y - zy;
 					// Telemetria (gui-64): salto bruto por
 					// frame en px de zona.
-					g_tp_touch_t = OSGetTime();
 					int dlx = lx - g_touch_last_lx;
 					int dly = ly - g_touch_last_ly;
 					if(dlx < 0)
@@ -3419,7 +4056,6 @@ int main(int argc, char **argv)
 				int lx = (int)tp.x - zx, ly = (int)tp.y - zy;
 				g_tp_down = true;
 				g_tp_moved = false;
-				g_tp_touch_t = OSGetTime(); // anti-parpadeo
 				g_touch_begins++;
 				g_touch_last_lx = lx;
 				g_touch_last_ly = ly;
@@ -3470,6 +4106,137 @@ int main(int argc, char **argv)
 			else
 				stop_touch_prev = false;
 
+			// --- Icono de micrófono (esquina inferior izquierda) ---
+			// Solo sin contacto del touchpad en curso. Presión
+			// corta = alternar mic; mantener400 ms = abrir el
+			// slider de volumen que sale justo arriba (misma
+			// pulsación pasa a arrastrar la pista y al soltar ya
+			// no alterna). Tocar fuera del slider y de su icono
+			// lo cierra con fundido, dejando el valor final en
+			// el log.
+			if(!g_tp_down)
+			{
+				int mx, my, md;
+				mic_button_rect(854, 480, &mx, &my, &md);
+				int slx, sly, slw, slh;
+				mic_slider_rect(854, 480, &slx, &sly, &slw,
+						&slh);
+				const int mpad = 16;
+				bool minside =
+					tp.touched && (int)tp.x >= mx - mpad &&
+					(int)tp.x < mx + md + mpad &&
+					(int)tp.y >= my - mpad &&
+					(int)tp.y < my + md + mpad;
+				bool slinside =
+					g_mic_slider_open && tp.touched &&
+					(int)tp.x >= slx - mpad &&
+					(int)tp.x < slx + slw + mpad &&
+					(int)tp.y >= sly - mpad &&
+					(int)tp.y < sly + slh + mpad;
+				uint64_t nowm = OSGetTime();
+				bool press_edge =
+					tp.touched && !mic_was_touched;
+
+				// Inicio de la pulsación: el contexto (¿empezó
+				// en el icono?) se congela hasta el soltado.
+				if(press_edge)
+				{
+					mic_press_on_icon = minside;
+					g_mic_hold_t0 = nowm;
+					g_mic_hold_fired = false;
+				}
+
+				// Tocar fuera del slider (y fuera de su icono,
+				// que es su ancla) lo cierra ya con el fundido
+				// de salida; el valor final va al log. Así un
+				// toque en cualquier otra parte —incluida la
+				// zona del touchpad— lo descarta.
+				if(g_mic_slider_open && press_edge &&
+				   !slinside && !minside)
+				{
+					g_mic_slider_open = false;
+					logprintf(
+						"Mic: volumen de captura %d%%",
+						g_config.mic_gain_pct);
+				}
+				// Presión mantenida400 ms en el icono ->
+				// slider abierto y el mismo dedo pasa a ser
+				// el puntero de arrastre.
+				if(minside && mic_press_on_icon &&
+				   !g_mic_hold_fired &&
+				   nowm - g_mic_hold_t0 >=
+					   OSMillisecondsToTicks(400))
+				{
+					g_mic_hold_fired = true;
+					g_mic_slider_open = true;
+					g_mic_drag = true;
+					logprintf(
+						"Mic: slider de volumen (%d%%)",
+						g_config.mic_gain_pct);
+				}
+
+				// Arrastre de la pista: solo se mapea DENTRO de
+				// la pista — la pulsación larga arranca en el
+				// icono (debajo) y hasta que el dedo suba no se
+				// toca el valor. Arriba = máx (200), abajo =0.
+				if(g_mic_slider_open && tp.touched &&
+				   (g_mic_drag || slinside))
+				{
+					float rel = (float)((int)tp.y - sly);
+					if(rel >= 0.0f &&
+					   rel <= (float)slh)
+					{
+						// De 25 en 25: 9 posiciones
+						// sobre la pista (0..200).
+						int pos =
+							(int)((1.0f -
+							       rel /
+								       (float)slh) *
+							      (float)(200 /
+								      MIC_GAIN_STEP_PCT) +
+							      0.5f);
+						int pct =
+							pos * MIC_GAIN_STEP_PCT;
+						if(pct !=
+						   g_config.mic_gain_pct)
+						{
+							g_config.mic_gain_pct =
+								pct;
+							g_config_dirty = true;
+						}
+					}
+					g_mic_drag = true;
+				}
+				if(!tp.touched)
+					g_mic_drag = false;
+
+				// Soltado tras una pulsación que empezó en el
+				// icono y no llegó a ser larga: alternar. Si
+				// el dedo salió del icono con la pulsación en
+				// curso, se cancela (mic_touch_prev ya es false).
+				if(!tp.touched && mic_was_touched &&
+				   mic_press_on_icon && mic_touch_prev &&
+				   !g_mic_hold_fired)
+					mic_toggle();
+				if(!tp.touched)
+				{
+					mic_press_on_icon = false;
+					g_mic_hold_fired = false;
+				}
+				mic_touch_prev = minside;
+				mic_was_touched = tp.touched;
+			}
+			else
+			{
+				// Con el touchpad ocupado (o teclado/sin sesión)
+				// se reinicia toda la pulsación del micrófono.
+				mic_touch_prev = false;
+				mic_was_touched = tp.touched;
+				mic_press_on_icon = false;
+				g_mic_hold_fired = false;
+				g_mic_drag = false;
+			}
+
 			// --- Zoom por doble-toque (gui-62) ---
 			// Resto de la pantalla (fuera del touchpad y de la
 			// parada): dos toques cortos (<300 ms, quietos) a
@@ -3489,6 +4256,11 @@ int main(int argc, char **argv)
 					      &zh2);
 				int sx2, sy2, sd2;
 				stop_button_rect(854, 480, &sx2, &sy2, &sd2);
+				int mx2, my2, md2;
+				mic_button_rect(854, 480, &mx2, &my2, &md2);
+				int slx2, sly2, slw2, slh2;
+				mic_slider_rect(854, 480, &slx2, &sly2, &slw2,
+						&slh2);
 				bool in_other =
 					((int)tp.x >= zx2 &&
 					 (int)tp.x < zx2 + zw2 &&
@@ -3497,7 +4269,16 @@ int main(int argc, char **argv)
 					((int)tp.x >= sx2 - 16 &&
 					 (int)tp.x < sx2 + sd2 + 16 &&
 					 (int)tp.y >= sy2 - 16 &&
-					 (int)tp.y < sy2 + sd2 + 16);
+					 (int)tp.y < sy2 + sd2 + 16) ||
+					((int)tp.x >= mx2 - 16 &&
+					 (int)tp.x < mx2 + md2 + 16 &&
+					 (int)tp.y >= my2 - 16 &&
+					 (int)tp.y < my2 + md2 + 16) ||
+					(g_mic_slider_open &&
+					 (int)tp.x >= slx2 - 16 &&
+					 (int)tp.x < slx2 + slw2 + 16 &&
+					 (int)tp.y >= sly2 - 16 &&
+					 (int)tp.y < sly2 + slh2 + 16);
 				if(!in_other)
 				{
 					if(!g_zoom_tap_prev)
@@ -3605,7 +4386,13 @@ int main(int argc, char **argv)
 			// no un deslizamiento (gui-65: razon del corte, del
 			// parpadeo original y del flood de "Touch: crudo").
 			stop_touch_prev = false;
+			mic_touch_prev = false;
+			mic_was_touched = false;
+			mic_press_on_icon = false;
+			g_mic_hold_fired = false;
+			g_mic_drag = false;
 			g_tp_down = false;
+			tp_worm_n = 0; // el gusano se corta con la sesión
 			g_tp_diag = false;
 		}
 
@@ -3628,6 +4415,9 @@ int main(int argc, char **argv)
 			uint64_t frames = g_video_frames;
 			// Relleno del ring AX por detras del playhead del DSP.
 			audio_update();
+			// Micrófono: drena el anillo MIC y entrega frames opus
+			// (una vez por vuelta, fuera de los pases de dibujo).
+			mic_poll();
 			// Inicio del stream: el surface del touchpad aparece
 			// transparente2 s para situarlo sin tapar el juego.
 			if(!g_tp_stream_seen && frames > 0)
@@ -3753,6 +4543,21 @@ int main(int argc, char **argv)
 				g_touch_ends = 0;
 				g_touch_spikes = 0;
 				g_touch_maxjump = 0;
+				// Telemetría del micrófono (gui-67):
+				// entradas/s confirma la tasa del sistema
+				// (32000) y el pico responde a la voz — sin
+				// una línea por segundo de ruido.
+				if(g_mic_hw_open)
+				{
+					logprintf("Mic: entradas=%u/s peak=%d %s",
+						  g_mic_consumed_win / 3,
+						  g_mic_peak_win,
+						  g_mic_wanted && !g_mic_muted
+							  ? "activo"
+							  : "silenciado");
+					g_mic_consumed_win = 0;
+					g_mic_peak_win = 0;
+				}
 			}
 		}
 
@@ -3791,9 +4596,10 @@ int main(int argc, char **argv)
 			// Sin muestra de video aun: tarjeta "Conectando".
 			if(g_video_frames == 0)
 				draw_connecting(1920, 1080);
-			draw_stop_button(1920, 1080);
-			// El surface del touchpad es solo en el DRC: la TV no
-			// tiene tactil y no debe tapar el juego.
+			// Parada y micrófono solo en el DRC (gui-67): en la
+			// TV se bugueaban y encima la TV no tiene táctil —
+			// se tocan en la pantalla de abajo. El surface del
+			// touchpad tampoco se pinta aquí (no tapa el juego).
 		}
 		else
 			draw_menu(1920, 1080);
@@ -3809,6 +4615,7 @@ int main(int argc, char **argv)
 			if(g_video_frames == 0)
 				draw_connecting(854, 480);
 			draw_stop_button(854, 480);
+			draw_mic_button(854, 480);
 			draw_touchpad(854, 480);
 		}
 		else
