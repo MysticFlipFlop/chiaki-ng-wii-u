@@ -2,7 +2,7 @@
 ![chiaki-ng Logo](gui/res/chiaking-logo.svg)
 
 # [chiaki-ng](https://streetpea.github.io/chiaki-ng/) for Wii u (by MysticFlipFlop)
-![chiaki-ng Logo](assets wii u/ppic.jpeg)
+![chiaki-ng Logo](assets-wii-u/ppic.jpeg)
 
 An open source PlayStation remote play project serving as the next-generation of Chiaki with improvements and ongoing support now that the original Chiaki project is in maintenance mode only. [Click here to see the accompanying site for documentation, updates and more](https://streetpea.github.io/chiaki-ng/).
 
