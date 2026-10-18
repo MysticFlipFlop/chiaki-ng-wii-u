@@ -185,6 +185,12 @@ static uint64_t g_video_log_iters = 0;
 // dedo quieto y el mapeo al pad lo amplifica; se ignora movimiento de
 // menos de esta distancia (en px de la zona) del punto establecido.
 #define TP_JITTER_PX 3
+// Antirrebote del tap de zoom (gui-63/64): la DRC suelta el contacto
+// unos ms mientras se aprieta; el tap del zoom solo se confirma si el
+// dedo no vuelve en este margen (un press ruidoso no vale como dos
+// toques). El TOQUE del touchpad NO usa antirrebote de input — rompia
+// clicks y arrastres (gui-63); su rebote se oculta en lo visual.
+#define TP_REBIND_MS 80
 static bool g_tp_down = false;      // contacto vigente en la zona
 static uint16_t g_tp_x = 0;         // pos mapeada al pad (x)
 static uint16_t g_tp_y = 0;         // pos mapeada al pad (y)
@@ -196,12 +202,36 @@ static int g_tp_ly0 = 0;            // pos inicial dentro de la zona (y)
 static float g_tp_ax = 0.0f;       // punto estable que sigue la salida (x)
 static float g_tp_ay = 0.0f;       // punto estable que sigue la salida (y)
 static uint64_t g_tp_down_ticks = 0; // instante del contacto (tap)
+// Telemetria de tactil (gui-64): rebotes y picos del sensor en la
+// zona del touchpad, resumidos cada 3 s en el log. g_tp_touch_t es
+// ademas el ultimo contacto visto (anti-parpadeo visual del surface).
+static uint64_t g_tp_touch_t = 0;
+static uint32_t g_touch_begins = 0;  // contactos iniciados en la zona
+static uint32_t g_touch_ends = 0;    // soltadas confirmadas
+static uint32_t g_touch_spikes = 0;  // frames con salto >12 px
+static uint32_t g_touch_maxjump = 0; // mayor salto por frame (px zona)
+static int g_touch_last_lx = 0;      // pos cruda previa (x)
+static int g_touch_last_ly = 0;      // pos cruda previa (y)
 static uint64_t g_tp_click_ticks = 0; // deadline del pulso de click
 static bool g_tp_diag = false;      // primer contacto de sesion logueado
 // Surface transitorio: visible solo hasta esta deadline (2 s tras el
 // primer frame de stream, y mientras tocas + 2 s tras soltar).
 static uint64_t g_tp_show_until = 0;
 static bool g_tp_stream_seen = false; // ya llego el primer frame de video
+
+// Zoom por doble-toque (gui-62): estado del toque en curso y del
+// ultimo tap aceptado, para detectar dos seguidos en el resto de la
+// pantalla (fuera de las zonas touchpad y parada).
+static bool g_zoom_tap_prev = false;   // contacto en curso en la zona
+static bool g_zoom_tap_moved = false;  // se aparto >20 px del inicio
+static uint64_t g_zoom_tap_t0 = 0;     // inicio del contacto actual
+static int g_zoom_tap_x0 = 0;          // pos inicial (x)
+static int g_zoom_tap_y0 = 0;          // pos inicial (y)
+static bool g_zoom_tap_armed = false;  // hay un primer tap esperando
+static uint64_t g_zoom_tap_last_t = 0; // soltada del primer tap
+static int g_zoom_tap_last_x = 0;      // pos del primer tap (x)
+static int g_zoom_tap_last_y = 0;      // pos del primer tap (y)
+static uint64_t g_zoom_tap_lift_t = 0; // gracia antirrebote del tap
 
 // Teclado del sistema (nn::swkbd)
 enum class Prompt { None, IP, PsnId, AccountId, Pin, LoginPin };
@@ -1993,7 +2023,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-61"
+#define APP_BUILD_TAG "gui-65"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2128,9 +2158,16 @@ static void draw_touchpad(int w, int h)
 	// azulado oscuro. Con dedo encima se aclara a gris medio para
 	// localizar el toque. El alpha se multiplica por el fundido de
 	// salida.
-	uint32_t col = g_tp_down ? GUI_RGBA(0x94, 0x94, 0x94, 0)
+	// Dedo "encima" con histéresis visual (gui-64): el tactil de la
+	// DRC rebota al apretar y con el contacto a un frame el surface
+	// parpadeaba — el brillo se mantiene 250 ms tras el ultimo
+	// contacto aunque el input vea el rebote.
+	bool near_touch =
+		g_tp_down ||
+		OSGetTime() - g_tp_touch_t < OSMillisecondsToTicks(250);
+	uint32_t col = near_touch ? GUI_RGBA(0x94, 0x94, 0x94, 0)
 				 : GUI_RGBA(0x3d, 0x3d, 0x3d, 0);
-	uint32_t a = (uint32_t)((g_tp_down ? 0xbf : 0x99) * fade + 0.5f);
+	uint32_t a = (uint32_t)((near_touch ? 0xbf : 0x99) * fade + 0.5f);
 	// (Con la codificacion BE de GUI_RGBA el alfa va en el byte bajo:
 	// col lleva a=0 y el fundido se OR-ea encima.)
 	gui_image((float)x, (float)y, (float)rw, (float)rh, tu, tv, tw, th,
@@ -3280,6 +3317,23 @@ int main(int argc, char **argv)
 					// Arrastre: clamp a la zona y mapeo lineal
 					// al pad completo (1920x1079).
 					int lx = (int)tp.x - zx, ly = (int)tp.y - zy;
+					// Telemetria (gui-64): salto bruto por
+					// frame en px de zona.
+					g_tp_touch_t = OSGetTime();
+					int dlx = lx - g_touch_last_lx;
+					int dly = ly - g_touch_last_ly;
+					if(dlx < 0)
+						dlx = -dlx;
+					if(dly < 0)
+						dly = -dly;
+					int dj = (dlx > dly) ? dlx : dly;
+					if(dj > (int)g_touch_maxjump)
+						g_touch_maxjump =
+							(uint32_t)dj;
+					if(dj > 12)
+						g_touch_spikes++;
+					g_touch_last_lx = lx;
+					g_touch_last_ly = ly;
 					if(lx < 0)
 						lx = 0;
 					else if(lx >= zw)
@@ -3291,30 +3345,37 @@ int main(int argc, char **argv)
 					if(lx - g_tp_lx0 > 12 || g_tp_lx0 - lx > 12 ||
 					   ly - g_tp_ly0 > 12 || g_tp_ly0 - ly > 12)
 						g_tp_moved = true;
-					// Antitemblor + inercia: con el dedo quieto
-					// la pos no cambia (banda de TP_JITTER_PX)
-					// y la PS4 ve el dedo parado. En movimiento
-					// el punto estable no salta al crudo (que
-					// tiembla y se ve erratico): lo sigue con
-					// inercia (0.3 de la distancia por
-					// frame); los gestos rapidos (>12 px por
-					// frame) van directos para no perder
-					// precision.
+					// Antitemblor (gui-65): UN solo camino de
+					// seguimiento. El anterior alternaba
+					// inercia 0.3 (<=12 px/frame) con salto
+					// directo (>12 px) y un gesto normal cruza
+					// los 12 px sin parar (la telemetria da
+					// deltas de 11-18 px/frame), asi que la
+					// salida zarpaba entre remolque y tirón.
+					// El sensor sale limpio (spikes=0,
+					// maxjump=7 px), asi que basta:
+					// - |e| <= 3 px: ruido, no se envia (dedo
+					//   quieto = quieto);
+					// - normal: ax += e * 0.7 (retardo bajo y
+					//   siempre igual, sin cambios de umbral a
+					//   mitad del gesto);
+					// - e > 40 px/frame (flick de verdad):
+					//   directo, sin remolque.
 					float ex = (float)lx - g_tp_ax;
 					float ey = (float)ly - g_tp_ay;
 					if(ex > TP_JITTER_PX || -ex > TP_JITTER_PX ||
 					   ey > TP_JITTER_PX || -ey > TP_JITTER_PX)
 					{
-						if(ex > 12.0f || ex < -12.0f ||
-						   ey > 12.0f || ey < -12.0f)
+						if(ex > 40.0f || ex < -40.0f ||
+						   ey > 40.0f || ey < -40.0f)
 						{
 							g_tp_ax = (float)lx;
 							g_tp_ay = (float)ly;
 						}
 						else
 						{
-							g_tp_ax += ex * 0.3f;
-							g_tp_ay += ey * 0.3f;
+							g_tp_ax += ex * 0.7f;
+							g_tp_ay += ey * 0.7f;
 						}
 						unsigned nx =
 							(unsigned)(int)(g_tp_ax + 0.5f);
@@ -3330,7 +3391,13 @@ int main(int argc, char **argv)
 				{
 					// Levantado: toque corto y quieto = click
 					// del touchpad (pulso tras subir el dedo).
+					// Sin antirrebote de input (gui-64): el
+					// rebote del sensor se oculta en lo
+					// visual del surface, pero el flujo de
+					// input vuelve al de toda la vida (en
+					// gui-63 rompia clicks y arrastres).
 					g_tp_down = false;
+					g_touch_ends++;
 					if(!g_tp_moved &&
 					   OSGetTime() - g_tp_down_ticks <
 						   OSMillisecondsToTicks(300))
@@ -3350,6 +3417,10 @@ int main(int argc, char **argv)
 				int lx = (int)tp.x - zx, ly = (int)tp.y - zy;
 				g_tp_down = true;
 				g_tp_moved = false;
+				g_tp_touch_t = OSGetTime(); // anti-parpadeo
+				g_touch_begins++;
+				g_touch_last_lx = lx;
+				g_touch_last_ly = ly;
 				g_tp_lx0 = lx;
 				g_tp_ly0 = ly;
 				g_tp_ax = (float)lx; // punto estable de partida
@@ -3396,11 +3467,141 @@ int main(int argc, char **argv)
 			}
 			else
 				stop_touch_prev = false;
+
+			// --- Zoom por doble-toque (gui-62) ---
+			// Resto de la pantalla (fuera del touchpad y de la
+			// parada): dos toques cortos (<300 ms, quietos) a
+			// menos de 28 px y 350 ms hacen zoom x2 centrado en
+			// el punto; otro doble-toque lo apaga. Mismo recorte
+			// en TV y DRC (mismo quad).
+			if(g_tp_down)
+			{
+				g_zoom_tap_prev = false;
+				g_zoom_tap_lift_t = 0;
+			}
+			else if(touched)
+			{
+				g_zoom_tap_lift_t = 0; // volvio: mismo toque
+				int zx2, zy2, zw2, zh2;
+				touchpad_rect(854, 480, &zx2, &zy2, &zw2,
+					      &zh2);
+				int sx2, sy2, sd2;
+				stop_button_rect(854, 480, &sx2, &sy2, &sd2);
+				bool in_other =
+					((int)tp.x >= zx2 &&
+					 (int)tp.x < zx2 + zw2 &&
+					 (int)tp.y >= zy2 &&
+					 (int)tp.y < zy2 + zh2) ||
+					((int)tp.x >= sx2 - 16 &&
+					 (int)tp.x < sx2 + sd2 + 16 &&
+					 (int)tp.y >= sy2 - 16 &&
+					 (int)tp.y < sy2 + sd2 + 16);
+				if(!in_other)
+				{
+					if(!g_zoom_tap_prev)
+					{
+						g_zoom_tap_prev = true;
+						g_zoom_tap_t0 = OSGetTime();
+						g_zoom_tap_x0 = (int)tp.x;
+						g_zoom_tap_y0 = (int)tp.y;
+						g_zoom_tap_moved = false;
+					}
+					else if((int)tp.x - g_zoom_tap_x0 >
+						 20 ||
+						 g_zoom_tap_x0 - (int)tp.x >
+							 20 ||
+						 (int)tp.y - g_zoom_tap_y0 >
+							 20 ||
+						 g_zoom_tap_y0 - (int)tp.y >
+							 20)
+						g_zoom_tap_moved = true;
+				}
+				else
+					g_zoom_tap_prev = false; // paso a otra zona
+			}
+			else if(g_zoom_tap_prev)
+			{
+				// Contacto perdido: antirrebote (gui-63),
+				// igual que en el touchpad — el tap se
+				// confirma solo si el dedo no vuelve en
+				// TP_REBIND_MS (asi un press ruidoso no
+				// vale como dos toques y un zoom fantasma).
+				uint64_t nowz = OSGetTime();
+				if(g_zoom_tap_lift_t == 0)
+					g_zoom_tap_lift_t = nowz;
+				if(nowz - g_zoom_tap_lift_t <
+				   OSMillisecondsToTicks(TP_REBIND_MS))
+				{
+					// Gracia en curso: el toque sigue.
+				}
+				else
+				{
+					// Tap confirmado: corto y quieto.
+					// Dos seguidos = zoom.
+					g_zoom_tap_prev = false;
+					g_zoom_tap_lift_t = 0;
+					int tx = g_zoom_tap_x0;
+					int ty = g_zoom_tap_y0;
+					if(!g_zoom_tap_moved &&
+					   nowz - g_zoom_tap_t0 <
+						   OSMillisecondsToTicks(300))
+					{
+						int dx = tx - g_zoom_tap_last_x;
+						int dy = ty - g_zoom_tap_last_y;
+						if(dx < 0)
+							dx = -dx;
+						if(dy < 0)
+							dy = -dy;
+						if(g_zoom_tap_armed && dx < 28 &&
+						   dy < 28 &&
+						   nowz - g_zoom_tap_last_t <
+							   OSMillisecondsToTicks(
+								   350))
+						{
+							g_zoom_tap_armed = false;
+							if(wiiu_video_zoom_on())
+							{
+								wiiu_video_set_zoom(
+									false,
+									0.f,
+									0.f);
+								logprintf(
+									"Zoom: apagado");
+							}
+							else
+							{
+								wiiu_video_set_zoom(
+									true,
+									(float)tx /
+										854.f,
+									(float)ty /
+										480.f);
+								logprintf(
+									"Zoom: x2 centrado en el toque (doble-toque otra vez para apagar)");
+							}
+						}
+						else
+						{
+							g_zoom_tap_armed = true;
+							g_zoom_tap_last_x = tx;
+							g_zoom_tap_last_y = ty;
+							g_zoom_tap_last_t =
+								nowz;
+						}
+					}
+				}
+			}
 		}
-		else
+		else if(!g_session_active || g_swkbd_visible)
 		{
 			// Sin sesion o con teclado abierto: reinicia todo para
-			// que el proximo toque cuente.
+			// que el proximo toque cuente. Con la sesion activa no
+			// se entra aqui en un frame sin muestras de VPAD
+			// (error != SUCCESS, normal en la Wii U): antes mataba
+			// g_tp_down a cada rato y el arrastre se reiniciaba con
+			// id nuevo cada ~35 ms — la PS4 veia un baile de taps,
+			// no un deslizamiento (gui-65: razon del corte, del
+			// parpadeo original y del flood de "Touch: crudo").
 			stop_touch_prev = false;
 			g_tp_down = false;
 			g_tp_diag = false;
@@ -3535,6 +3736,21 @@ int main(int argc, char **argv)
 					g_video_log_iters = g_main_iters;
 				}
 				g_video_log_ticks = now;
+				// Telemetria de tactil (gui-64): rebotes y
+				// picos del sensor en la zona del touchpad.
+				// Al mantener el dedo, ends>>0 = el sensor
+				// rebota; spikes/maxjump = picos de posicion
+				// (px de zona, sin amplificar al pad).
+				logprintf(
+					"Touch: begins=%u ends=%u spikes=%u maxjump=%u px pos=(%u,%u) down=%d",
+					g_touch_begins, g_touch_ends,
+					g_touch_spikes, g_touch_maxjump,
+					(unsigned)g_tp_x, (unsigned)g_tp_y,
+					g_tp_down ? 1 : 0);
+				g_touch_begins = 0;
+				g_touch_ends = 0;
+				g_touch_spikes = 0;
+				g_touch_maxjump = 0;
 			}
 		}
 

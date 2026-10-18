@@ -37,6 +37,15 @@ void wiiu_video_render(int viewport_w, int viewport_h);
 // sesion, y en el apagado de la app.
 void wiiu_video_reset(bool wait_gpu = true);
 
+// Zoom de vision durante la sesion (gui-62): recorta el quad a la
+// ventana UV centrada en (cu, cv) con factor x2 (moderado a proposito:
+// la mitad del cuadro en pantalla). El mismo recorte se dibuja en TV y
+// DRC (mismo quad); (cu, cv) normalizados con v=0 arriba. on=false
+// restaura el cuadro completo (transicion ease-out de 300 ms, gui-63).
+// Hilo principal; cada sesion arranca sin zoom.
+void wiiu_video_set_zoom(bool on, float cu, float cv);
+bool wiiu_video_zoom_on(void);
+
 struct WiiUVideoStats
 {
 	uint64_t fed;     // muestras alimentadas

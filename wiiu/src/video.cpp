@@ -1182,10 +1182,16 @@ bool wiiu_video_sample(uint8_t *buf, size_t buf_size)
 // 21 Hz y ~20 fps visibles.
 // ---------------------------------------------------------------------------
 
+static void zoom_anim_step(void); // definicion tras wiiu_video_render
+
 void wiiu_video_upload()
 {
 	if(!s_lock_inited)
 		return;
+
+	// Transicion de zoom (gui-63): una vez por vuelta y fuera de los
+	// pases (ni TV ni DRC la llaman, asi que no se avanza dos veces).
+	zoom_anim_step();
 
 	OSLockMutex(&s_lock);
 
@@ -1380,6 +1386,115 @@ void wiiu_video_render(int viewport_w, int viewport_h)
 	GX2DrawEx(GX2_PRIMITIVE_MODE_QUADS, 4, 0, 1);
 }
 
+// Zoom de vision (gui-62/63): ventana UV del quad fullscreen. x2 = la
+// mitad del cuadro en pantalla — moderado a proposito ("no tanto
+// zoom"). La alternancia no salta: una transicion ease-out de 300 ms
+// interpola las UVs, avanzada una vez por vuelta del bucle principal
+// (wiiu_video_upload). El mismo buffer dibuja TV y DRC, asi que ambas
+// ven el mismo recorte.
+#define VIDEO_ZOOM_FACTOR 2.0f
+#define VIDEO_ZOOM_ANIM_MS 300
+
+static bool s_zoom_on = false;              // estado objetivo (getter)
+static bool s_zoom_anim = false;            // transicion en curso
+static uint64_t s_zoom_t0 = 0;              // inicio de la transicion
+static float s_zoom_a[4] = { 0.f, 0.f, 1.f, 1.f }; // ventana origen
+static float s_zoom_b[4] = { 0.f, 0.f, 1.f, 1.f }; // ventana destino
+static float s_zoom_cur[4] = { 0.f, 0.f, 1.f, 1.f }; // ultima escrita
+
+bool wiiu_video_zoom_on(void)
+{
+	return s_zoom_on;
+}
+
+// Escribe las UVs del quad (posiciones intactas; orden perimetro
+// TL,TR,BR,BL como render_init; v=0 arriba). Silencioso sin buffer.
+static void zoom_write_uv(const float w[4])
+{
+	if(!s_render_ready || !s_vbuf.buffer)
+		return;
+	const VideoVert verts[4] = {
+		{ -1.f, 1.f, 0xffffffffu, w[0], w[1] },
+		{ 1.f, 1.f, 0xffffffffu, w[2], w[1] },
+		{ 1.f, -1.f, 0xffffffffu, w[2], w[3] },
+		{ -1.f, -1.f, 0xffffffffu, w[0], w[3] },
+	};
+	void *p = GX2RLockBufferEx(&s_vbuf, GX2R_RESOURCE_BIND_NONE);
+	if(p)
+	{
+		memcpy(p, verts, sizeof(verts));
+		GX2RUnlockBufferEx(&s_vbuf, GX2R_RESOURCE_BIND_NONE);
+	}
+	memcpy(s_zoom_cur, w, sizeof(s_zoom_cur));
+}
+
+// Ventana interpolada en este instante: encadena toggles a mitad de
+// transicion sin salto ( el origen pasa a ser lo que se esta viendo).
+static void zoom_now(float w[4])
+{
+	if(!s_zoom_anim)
+	{
+		memcpy(w, s_zoom_cur, sizeof(s_zoom_cur));
+		return;
+	}
+	float p = (float)OSTicksToMilliseconds(OSGetTime() - s_zoom_t0) /
+		   (float)VIDEO_ZOOM_ANIM_MS;
+	if(p >= 1.f)
+		p = 1.f;
+	p = 1.f - (1.f - p) * (1.f - p); // ease-out: suave al parar
+	for(int i = 0; i < 4; i++)
+		w[i] = s_zoom_a[i] + (s_zoom_b[i] - s_zoom_a[i]) * p;
+}
+
+void wiiu_video_set_zoom(bool on, float cu, float cv)
+{
+	s_zoom_on = on;
+
+	// Ventana destino centrada en el toque con clamp a bordes: nunca
+	// sale del cuadro (cerca del borde se queda pegada a el).
+	float to[4] = { 0.f, 0.f, 1.f, 1.f };
+	if(on)
+	{
+		const float half = 0.5f / VIDEO_ZOOM_FACTOR;
+		to[0] = cu - half;
+		to[1] = cv - half;
+		if(to[0] < 0.f)
+			to[0] = 0.f;
+		else if(to[0] > 1.f - 2.f * half)
+			to[0] = 1.f - 2.f * half;
+		if(to[1] < 0.f)
+			to[1] = 0.f;
+		else if(to[1] > 1.f - 2.f * half)
+			to[1] = 1.f - 2.f * half;
+		to[2] = to[0] + 2.f * half;
+		to[3] = to[1] + 2.f * half;
+	}
+
+	zoom_now(s_zoom_a); // origen = lo que se ve ahora (encadenado)
+	memcpy(s_zoom_b, to, sizeof(s_zoom_b));
+	s_zoom_t0 = OSGetTime();
+	s_zoom_anim = true;
+}
+
+// Una vez por vuelta del bucle principal: avanza la transicion y
+// escribe las UVs cuando cambian (la ultima fija el destino exacto).
+static void zoom_anim_step(void)
+{
+	if(!s_zoom_anim)
+		return;
+	bool last = (OSGetTime() - s_zoom_t0) >=
+		    OSMillisecondsToTicks(VIDEO_ZOOM_ANIM_MS);
+	float w[4];
+	if(last)
+		memcpy(w, s_zoom_b, sizeof(w));
+	else
+		zoom_now(w);
+	if(last || memcmp(w, s_zoom_cur, sizeof(w)) != 0)
+		zoom_write_uv(w);
+	if(last)
+		s_zoom_anim = false;
+}
+
 void wiiu_video_reset(bool wait_gpu)
 {
 	lock_inited();
@@ -1407,6 +1522,8 @@ void wiiu_video_reset(bool wait_gpu)
 	s_h = 0;
 	s_disp_ready = -1;
 	s_disp_reading = -1;
+	s_zoom_on = false;   // zoom de vision (gui-62/63): proxima sesion
+	s_zoom_anim = false; // sin el y sin transicion en curso
 	s_dec_giveup = false;
 	s_init_logged = false;
 	s_render_err_logged = false;
