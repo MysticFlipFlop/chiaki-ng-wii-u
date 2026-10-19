@@ -1723,6 +1723,7 @@ static bool start_session()
 	char host[48];
 	snprintf(host, sizeof(host), "%s", g_host_addr);
 	uint16_t req_port = g_host_request_port;
+	ChiakiTarget host_target = g_host_target;
 	chiaki_mutex_unlock(&g_host_mutex);
 	if(!g_host_found)
 	{
@@ -1732,7 +1733,12 @@ static bool start_session()
 	}
 
 	ChiakiConnectInfo info = {};
-	info.ps5 = false; // session.c deriva CHIAKI_TARGET_PS4_10 y lo refina
+	// El discovery fija g_host_target (una PS5 resuelve CHIAKI_TARGET_PS5_1)
+	// y session.c deriva de info.ps5 el target y el RP-Version de la
+	// peticion: clavado en false, la PS5 contestaba "RP-Version mismatch".
+	// Sin snapshot del discovery (IP manual) seguimos asumiendo PS4.
+	info.ps5 = g_host_found && chiaki_target_is_ps5(host_target);
+	logprintf("Sesion: consola %s (target del discovery)", info.ps5 ? "PS5" : "PS4");
 	info.host = host;
 	memcpy(info.regist_key, g_regist_key, sizeof(info.regist_key));
 	memcpy(info.morning, g_morning, sizeof(info.morning));
@@ -1998,6 +2004,7 @@ static void handle_press_a()
 	char host[48];
 	snprintf(host, sizeof(host), "%s", g_host_addr);
 	ChiakiDiscoveryHostState state = g_host_state;
+	ChiakiTarget target = g_host_target;
 	chiaki_mutex_unlock(&g_host_mutex);
 	if(!g_host_found)
 	{
@@ -2020,9 +2027,9 @@ static void handle_press_a()
 		chiaki_mutex_unlock(&g_host_mutex);
 		key_hex[CHIAKI_SESSION_AUTH_SIZE] = 0;
 		uint64_t credential = strtoull(key_hex, NULL, 16);
-		logprintf("A: despertando la PS4 %s ...", host);
+		logprintf("A: despertando la consola %s ...", host);
 		ChiakiErrorCode err = chiaki_discovery_wakeup(&g_chiaki_log, NULL, host,
-							       credential, false);
+							       credential, chiaki_target_is_ps5(target));
 		if(err != CHIAKI_ERR_SUCCESS)
 			logprintf("A: wakeup fallo: %s", chiaki_error_string(err));
 		return;
@@ -2315,7 +2322,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-80"
+#define APP_BUILD_TAG "gui-81"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -3634,7 +3641,7 @@ int main(int argc, char **argv)
 
 	// Tras log_file_init para que el marker llegue a la SD (antes solo
 	// iba a OSReport/UDP y no servia para confirmar el build desplegado).
-	logprintf("BUILD wiiu-2026-10-16 " APP_BUILD_TAG);
+	logprintf("BUILD wiiu-2026-10-19 " APP_BUILD_TAG);
 	wiiu_video_set_log(video_log_sink);
 
 	// Fase 4a: consolas registradas y cuenta guardadas en la SD. Se carga
