@@ -111,16 +111,62 @@ The GamePad presents itself to the PS4 as a DualShock 4 with a **physical-positi
 2. **↑** → register the console: the system keyboard will ask for the Account ID and the **8-digit PIN** shown by the PS4 in *Settings → Link with another device*.
 3. The console appears in the list; **A** connects.
 
-## Building from source
+## Building for Wii U
 
-Requirements: [devkitPro](https://devkitpro.org/) with **devkitPPC**, **wut**, **portlibs/wiiu**, and the CMake toolchain (`cmake/WiiU.cmake`), plus CMake and a host C/C++ compiler.
+### Prerequisites
 
-```sh
-in progress, sorry
+- [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `wiiu-dev` package group installed
+- The `$DEVKITPRO` environment variable must be set
+- `git`, `cmake`, `ninja`, and `curl` available on your `PATH`
+
+### 1. Clone the repository and initialize submodules
+
+```bash
+git clone https://github.com/MysticFlipFlop/chiaki-ng-wii-u.git
+cd chiaki-ng-wii-u
+git submodule update --init \
+    third-party/nanopb \
+    third-party/jerasure \
+    third-party/gf-complete \
+    third-party/curl
 ```
-On Windows the toolchain path is `C:\devkitPro\cmake\WiiU.cmake`. The submodules (`nanopb`, `jerasure`, `gf-complete`, `munit`) are resolved with `--recursive`.
 
-**Output:** `build-wiiu/wiiu/chiaki-wiiu.rpx` and `build-wiiu/wiiu/chiaki-wiiu.wuhb`.
+### 2. Download and extract `json-c` and `miniupnp`
+
+```bash
+mkdir -p deps
+curl -sSL --retry 3 -o deps/json-c.tar.gz \
+    https://github.com/json-c/json-c/archive/refs/tags/json-c-0.17-20230812.tar.gz
+curl -sSL --retry 3 -o deps/miniupnp.tar.gz \
+    https://github.com/miniupnp/miniupnp/archive/refs/tags/miniupnpc_2_2_8.tar.gz
+
+tar --warning=no-timestamp -C deps -xzf deps/json-c.tar.gz \
+    --no-same-owner --no-same-permissions || true
+tar -C deps -xzf deps/miniupnp.tar.gz
+
+mv deps/json-c-json-c-0.17-20230812 deps/json-c
+mv deps/miniupnp-miniupnpc_2_2_8 deps/miniupnpc
+rm deps/*.tar.gz
+```
+
+### 3. Configure the build
+
+```bash
+cmake -B build-wiiu -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/WiiU.cmake \
+      -DCHIAKI_ENABLE_WIIU=ON \
+      -DCHIAKI_ENABLE_TESTS=OFF \
+      -DFETCHCONTENT_SOURCE_DIR_JSON-C=$PWD/deps/json-c \
+      -DFETCHCONTENT_SOURCE_DIR_MINIUPNPC=$PWD/deps/miniupnpc
+```
+
+### 4. Compile
+
+```bash
+cmake --build build-wiiu
+```
+
+The compiled `.wuhb`/`.elf` binary will be output inside the `build-wiiu` directory.
 
 ## Limitations and design decisions
 
