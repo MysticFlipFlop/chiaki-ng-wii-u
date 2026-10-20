@@ -39,7 +39,7 @@ chiaki.conf
 .cache/
 *.vscode
 site/
-hardware/config.ini
+hardware/
 
 # AI agent scaffolding: repo keeps only what the build needs
 AGENTS.md
