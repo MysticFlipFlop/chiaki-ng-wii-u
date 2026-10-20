@@ -166,7 +166,7 @@ cmake -B build-wiiu -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-wiiu
 ```
 
-The compiled `.wuhb`/`.elf` binary will be output inside the `build-wiiu` directory.
+The compiled `.wuhb`/`.elf` binaries are output inside `build-wiiu/wiiu/`.
 
 ## Limitations and design decisions
 
