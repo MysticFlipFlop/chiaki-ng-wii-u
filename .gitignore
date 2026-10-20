@@ -40,3 +40,16 @@ chiaki.conf
 *.vscode
 site/
 hardware/config.ini
+
+# AI agent scaffolding: repo keeps only what the build needs
+AGENTS.md
+.agents/
+CLAUDE.md
+.claude/
+GEMINI.md
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+opencode.json
+.opencode/
+.aider*
