@@ -47,6 +47,7 @@
 #include <coreinit/filesystem.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/mutex.h>
+#include <coreinit/thread.h>
 #include <sndcore2/core.h>
 #include <mic/mic.h> // mic.rpl: micrófono interno del GamePad (gui-67)
 #include <nn/swkbd.h>
@@ -124,6 +125,7 @@ enum {
 	SET_ROW_IP,
 	SET_ROW_QUALITY,
 	SET_ROW_VSYNC,
+	SET_ROW_LOG,
 	SET_ROW_DELETE,
 	SET_ROWS,
 };
@@ -309,7 +311,13 @@ static FSFileHandle g_log_fd = -1;
 // colgaba con el — la consola se congelaba al salir al HOME.
 static OSMutex g_log_mutex;
 static OSMutex g_logq_mutex; // solo head/tail; jamas se bloquea con ella
+// g_log_ready: el cliente FS de la SD esta montado (el config.ini se
+// puede leer y escribir aunque el log este apagado). g_log_active:
+// log.txt abierto y handler de WHB registrado — la fila "Log.txt" de
+// Ajustes lo alterna (gui-82); apagado por defecto.
 static bool g_log_ready = false;
+static bool g_log_active = false;
+static char g_log_path[160]; // ruta del log.txt (la rellena el init)
 
 // Cola de lineas pendientes de volcar a la SD. El handler SOLO encola
 // (microsegundos, jamas FS); la escritura la hace el bucle principal en
@@ -415,7 +423,7 @@ static void logq_drain_batch(void)
 // saliendo por UDP 4405 y por OSReport en la consola cafe).
 static void log_sd_handler(const char *str)
 {
-	if(!g_log_ready)
+	if(!g_log_active)
 		return;
 
 	if(!OSTryLockMutex(&g_logq_mutex))
@@ -482,8 +490,13 @@ static void video_log_sink(const char *line)
 	logprintf("%s", line);
 }
 
+static int sd_read_file(const char *path, char *buf, size_t cap);
+static bool config_log_enabled_probe(void); // definicion: seccion config
+
 // Requiere FSInit() ya llamado. Si la carpeta no existe, seguimos con
-// consola cafe + UDP y lo indicamos una sola vez.
+// consola cafe + UDP y lo indicamos una sola vez. Con el log.txt
+// desactivado en config (gui-82) aqui se cierra sin abrir y se
+// elimina el log.txt anterior.
 static void log_file_init()
 {
 	OSInitMutex(&g_log_mutex);
@@ -505,6 +518,9 @@ static void log_file_init()
 	// hardware. La mask de swkbd (cliente del sistema) queda como estaba.
 	FSAddClient(g_log_fs_client, FS_ERROR_FLAG_ALL);
 	FSInitCmdBlock(g_log_fs_cmd);
+	// El cliente FS ya sirve para el config.ini aunque el log acabe
+	// apagado (gui-82): sd_read_file/sd_write_file miran g_log_ready.
+	g_log_ready = true;
 	logprintf("Log SD: 1/5 cliente FS listo");
 
 	// Buffers que cruzan al modulo FSA con alineacion 64 (regla del FSA
@@ -545,15 +561,32 @@ static void log_file_init()
 	// (como en los juegos). Con "fs:" la capa FSA/fsc no resuelve la
 	// ruta: mkdir daba FATAL_ERROR y open NOT_FOUND en Cemu.
 	char log_dir[128];
-	char log_path[160];
 	snprintf(log_dir, sizeof(log_dir), "%s/wiiu/apps/chiaki", base);
-	snprintf(log_path, sizeof(log_path), "%s/log.txt", log_dir);
+	snprintf(g_log_path, sizeof(g_log_path), "%s/log.txt", log_dir);
+	const char *log_path = g_log_path; // la ruta persiste para Ajustes
 
 	// Carpeta propia, aunque el .wuhb no viva en apps/chiaki. Si ya
 	// existe, FSMakeDir devuelve ALREADY_EXISTS (-5), que ignoramos.
 	FSStatus mkdir_st = FSMakeDir(g_log_fs_client, g_log_fs_cmd, log_dir,
 				      FS_ERROR_FLAG_ALL);
 	logprintf("Log SD: 4/5 mkdir=%d", (int)mkdir_st);
+
+	// gui-91: el log se escribe SIEMPRE (mismo camino que gui-81,
+	// el unico validado en consola) — la fila Log.txt de Ajustes
+	// ahora solo decide si el fichero se ELIMINA al salir. El flag
+	// se pre-lee de config.ini aqui porque g_config se carga despues,
+	// en main(). Desactivado (tambien el default): borramos el
+	// log.txt que hubiera de la sesion anterior y seguimos.
+	if(!config_log_enabled_probe())
+	{
+		bool had = FSGetStat(g_log_fs_client, g_log_fs_cmd, g_log_path,
+				     &stat, FS_ERROR_FLAG_ALL) == FS_STATUS_OK;
+		if(had)
+			FSRemove(g_log_fs_client, g_log_fs_cmd, g_log_path,
+				 FS_ERROR_FLAG_ALL);
+		logprintf("Log SD: Log.txt desactivado%s — se borrara al salir",
+			  had ? " (el de la sesion anterior, eliminado)" : "");
+	}
 
 	// Rotacion: si el log anterior ya es grande, empezamos de cero.
 	if(FSGetStat(g_log_fs_client, g_log_fs_cmd, log_path, &stat,
@@ -575,41 +608,125 @@ static void log_file_init()
 			    log_path, (int)mount_st, (int)mkdir_st, (int)open_st);
 		return;
 	}
-	g_log_ready = true;
+	g_log_active = true; // log.txt abierto + handler de WHB registrado
 	WHBAddLogHandler(log_sd_handler);
 	logprintf("Log SD: escribiendo en %s", log_path);
 }
 
+// Traza del apagado: una linea por evento (consola cafe + UDP +
+// log.txt). Los instrumentos de diagnostico gui-84..91 (hilo de
+// latido, sondas crudas, interceptador de excepciones, tabla de
+// exports de coreinit, copias x3 con sleeps) se retiraron tras
+// validar el fix gui-91 en hardware.
+static void trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void trace(const char *fmt, ...)
+{
+	char msg[240];
+	va_list va;
+	va_start(va, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, va);
+	va_end(va);
+	logprintf("trace: %s", msg);
+}
+
 static void log_file_close()
 {
-	WHBRemoveLogHandler(log_sd_handler);
+	trace("lfc entro");
+	if(g_log_active)
+		WHBRemoveLogHandler(log_sd_handler);
+	g_log_active = false;
 	g_log_ready = false;
+	trace("lfc flags listos (activo=0 ready=0)");
 	// Unico escritor FS: ahora podemos bloquear con tranquilidad. Vacia
 	// la cola pendiente por lotes antes de cerrar.
 	OSLockMutex(&g_log_mutex);
+	trace("lfc mutex tomado");
 	for(;;)
 	{
 		size_t used = logq_take_batch(g_log_batch, sizeof(g_log_batch));
 		if(!used)
 			break;
+	trace("lfc cola CON datos (fd=%d)", (int)g_log_fd);
 		log_line_write(g_log_batch, (int)used);
 	}
+	trace("lfc cola vacia (fd=%d)", (int)g_log_fd);
 	if(g_log_fd >= 0)
 	{
 		FSFlushFile(g_log_fs_client, g_log_fs_cmd, g_log_fd, FS_ERROR_FLAG_ALL);
 		FSCloseFile(g_log_fs_client, g_log_fs_cmd, g_log_fd, FS_ERROR_FLAG_ALL);
+	trace("lfc fichero cerrado");
 		g_log_fd = -1;
 	}
+	// gui-91: Log.txt desactivado = el log se ELIMINA aqui (tras
+	// cerrar, antes de bajar el cliente FS) — la escritura durante
+	// la sesion es siempre la de gui-81, validada en hardware.
+	if(!g_config.log_enabled && g_log_path[0] && g_log_fs_client)
+	{
+		FSStatus rm = FSRemove(g_log_fs_client, g_log_fs_cmd,
+				       g_log_path, FS_ERROR_FLAG_ALL);
+		trace("lfc rm log.txt (rm=%d)", (int)rm);
+	}
+	trace("lfc antes de OSUnlock");
 	OSUnlockMutex(&g_log_mutex);
+	trace("lfc OSUnlock devuelto");
+	trace("lfc mutex soltado, viene FSDelClient");
 	if(g_log_fs_client)
 	{
+	trace("lfc FSDelClient llamando");
 		FSDelClient(g_log_fs_client, FS_ERROR_FLAG_ALL);
+	trace("lfc FSDelClient VOLVIO");
 		MEMFreeToDefaultHeap(g_log_fs_client);
 		MEMFreeToDefaultHeap(g_log_fs_cmd);
 		g_log_fs_client = nullptr;
 		g_log_fs_cmd = nullptr;
+	trace("lfc salio OK");
 	}
 }
+
+// Enciende/apaga la escritura del log.txt en caliente (fila Log.txt
+// de Ajustes, gui-82). Apagar: quita el handler, vacia la cola, cierra
+// y ELIMINA el fichero (lo ya generado). Encender: reabre en "append"
+// y vuelve a registrar el handler. Solo se toca el camino del log: el
+// cliente FS sigue vivo, asi que config.ini se sigue leyendo y
+// guardando (ahi vive la propia preferencia).
+static void log_set_enabled(bool enabled)
+{
+	if(!g_log_ready || !g_log_path[0])
+	{
+		logprintf("Log SD: no disponible (SD/FS no inicializados)");
+		return;
+	}
+	if(enabled == g_log_active)
+		return;
+	if(enabled)
+	{
+		FSStatus st = FSOpenFile(g_log_fs_client, g_log_fs_cmd,
+					  g_log_path, "a", &g_log_fd,
+					  FS_ERROR_FLAG_ALL);
+		if(st != FS_STATUS_OK)
+			st = FSOpenFile(g_log_fs_client, g_log_fs_cmd,
+					 g_log_path, "w", &g_log_fd,
+					 FS_ERROR_FLAG_ALL);
+		if(st != FS_STATUS_OK)
+		{
+			g_log_fd = -1;
+			logprintf("Log SD: fallo al reabrir %s (open=%d)",
+				  g_log_path, (int)st);
+			return;
+		}
+		g_log_active = true;
+		WHBAddLogHandler(log_sd_handler);
+		logprintf("Log SD: escritura activada — %s", g_log_path);
+	}
+	else
+	{
+			// gui-91: la escritura NO se toca (sigue activa como en
+		// gui-81); apagar solo marca la preferencia — el borrado
+		// ocurre al salir, en log_file_close.
+		logprintf("Log SD: Log.txt desactivado — se borrara al salir");
+	}
+}
+
 
 static void log_vpad_changes(const VPADStatus &status, uint32_t &last_hold,
 			     VPADTouchData &last_touch)
@@ -1071,6 +1188,22 @@ static bool apply_console(int idx)
 	g_registered = true;
 	g_menu_sel = idx;
 	return true;
+}
+
+// Pre-lee "log_enabled" (fila Log.txt de Ajustes) ANTES de que main()
+// cargue g_config: lo llama log_file_init para decidir si abrir o
+// eliminar el log.txt. Parsea en una Config temporal — g_config aun
+// no existe aqui. Sin config.ini o sin la clave (ficheros previos a
+// gui-82) → false = desactivado (default).
+static bool config_log_enabled_probe(void)
+{
+	int n = sd_read_file(CONFIG_SD_PATH, g_cfg_in, sizeof(g_cfg_in));
+	if(n <= 0)
+		return false;
+	Config probe;
+	config_init(&probe);
+	config_parse(&probe, g_cfg_in, (size_t)n);
+	return probe.log_enabled != 0;
 }
 
 static void config_load_sd(void)
@@ -2322,7 +2455,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-81"
+#define APP_BUILD_TAG "gui-92"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2826,12 +2959,18 @@ static void draw_touchpad(int w, int h)
 // Geometria de las filas de Ajustes: lista bajo el titulo, filas tipo
 // ItemDelegate (u*7, como la lista de consolas). Compartida por el
 // dibujo (TV y DRC) y el hit-test tactil del DRC (854x480).
-static void settings_row_geom(int w, int *list_y, int *row_h)
+static void settings_row_geom(int w, int h, int *list_y, int *row_h)
 {
 	int scale = (w >= 1280) ? 2 : 1;
 	int u = 8 * scale;
 	*list_y = (u * 3 + u / 2) + u * 6; // barra + titulo
 	*row_h = u * 7;
+	// Seis filas (gui-82: + Log.txt) tienen que caber por encima del
+	// hint: en la TV (720) u*7x6 se salia de la pantalla, ahi se
+	// compactan (la DRC, con u*7, queda intacta).
+	int fit = (h - *list_y - u * 2) / SET_ROWS;
+	if(fit < *row_h)
+		*row_h = fit;
 }
 
 // Geometria del menu contextual de presets (gui-61): panel centrado
@@ -2899,6 +3038,19 @@ static void settings_toggle_vsync(void)
 	logprintf("VSync: %s", g_config.vsync ? "activado" : "desactivado");
 }
 
+// Log.txt (gui-82/91): la casilla decide si el log se CONSERVA. El
+// log se escribe siempre (camino gui-81, validado en consola) y con
+// la casilla apagada se ELIMINA al salir. Persiste en config.ini
+// (default: desactivado).
+static void settings_toggle_log(void)
+{
+	g_config.log_enabled = g_config.log_enabled ? 0 : 1;
+	g_config_dirty = true;
+	log_set_enabled(g_config.log_enabled != 0);
+	logprintf("Log.txt: %s (persiste en config.ini)",
+		  g_config.log_enabled ? "activado" : "desactivado");
+}
+
 // Accion de una fila de Ajustes (A o toque en el DRC).
 static void settings_activate(int row)
 {
@@ -2935,6 +3087,8 @@ static void settings_activate(int row)
 	}
 	else if(row == SET_ROW_VSYNC)
 		settings_toggle_vsync();
+	else if(row == SET_ROW_LOG)
+		settings_toggle_log();
 	else if(row == SET_ROW_DELETE)
 	{
 		// Ultima fila de Ajustes. Cierra Ajustes (el dialogo
@@ -3052,7 +3206,7 @@ static void draw_menu(int w, int h)
 	if(g_settings_open)
 	{
 		int list_y, row_h;
-		settings_row_geom(w, &list_y, &row_h);
+		settings_row_geom(w, h, &list_y, &row_h);
 
 		gui_text((float)m, (float)(bar_h + u * 2), "Ajustes",
 			 c_text, scale * 2);
@@ -3126,6 +3280,11 @@ static void draw_menu(int w, int h)
 				value[0] = '\0'; // estado: checkbox, sin
 				                   // texto de valor
 			}
+			else if(i == SET_ROW_LOG)
+			{
+				label = "Log.txt";
+				value[0] = '\0'; // estado: checkbox, sin texto
+			}
 			else
 			{
 				// Ultima fila: elimina la consola
@@ -3161,17 +3320,20 @@ static void draw_menu(int w, int h)
 			gui_text((float)(w - m - u * 2) -
 					 gui_text_width(value, scale),
 				 (float)ty, value, vc, scale);
-			// Checkbox de VSync (gui-60): caja Material a la
-			// derecha — rellena en accent con ✓ si activo, solo
-			// borde (c_text2) si no; el interior del borde
-			// respeta el tinte de la fila activa.
-			if(i == SET_ROW_VSYNC)
+			// Checkbox de VSync (gui-60) y Log.txt (gui-82): caja
+			// Material a la derecha — rellena en accent con ✓ si
+			// activo, solo borde (c_text2) si no; el interior del
+			// borde respeta el tinte de la fila activa.
+			if(i == SET_ROW_VSYNC || i == SET_ROW_LOG)
 			{
+				bool on = (i == SET_ROW_VSYNC)
+						  ? (g_config.vsync != 0)
+						  : (g_config.log_enabled != 0);
 				float cb = (float)(u * 3 / 2); // 12 / 24 px
 				float cbx = (float)(w - m - u * 2) - cb;
 				float cby = (float)y +
 					     ((float)row_h - cb) / 2.f;
-				if(g_config.vsync)
+				if(on)
 				{
 					gui_rect(cbx, cby, cb, cb, c_accent);
 					gui_text(cbx + (cb - (float)u) / 2.f,
@@ -3855,6 +4017,8 @@ int main(int argc, char **argv)
 						else if(g_set_sel ==
 							SET_ROW_VSYNC)
 							settings_toggle_vsync();
+						else if(g_set_sel == SET_ROW_LOG)
+							settings_toggle_log();
 					}
 				}
 				else if(rising & VPAD_BUTTON_X)
@@ -4021,7 +4185,7 @@ int main(int argc, char **argv)
 				else
 				{
 					int list_y, row_h;
-					settings_row_geom(854, &list_y,
+					settings_row_geom(854, 480, &list_y,
 							  &row_h);
 					if((int)tp.y >= list_y)
 					{
@@ -4771,12 +4935,14 @@ int main(int argc, char **argv)
 	// -> graficos -> log -> red.
 	if(g_session_active)
 		stop_session(true);
+	logprintf("trace: sesion parada");
 	// Sin sesion activa no hay decoder, pero por si acaso (idempotente).
 	// wait_gpu=false: en el camino de shutdown GX2DrawDone puede DSI
 	// (helper de gx2 con el contexto en background) y el crash handler
 	// de wut suspende el hilo principal = consola congelada al volver
 	// al menu HOME tras transmitir.
 	wiiu_video_reset(false);
+	logprintf("trace: video reset");
 	if(g_regist_state == RegistState::Running)
 		chiaki_regist_stop(&g_regist);
 	if(g_regist_state != RegistState::Idle)
@@ -4784,15 +4950,23 @@ int main(int argc, char **argv)
 		chiaki_regist_fini(&g_regist);
 		g_regist_state = RegistState::Idle;
 	}
+	logprintf("trace: regist listo");
 	stop_discovery();
+	logprintf("trace: discovery detenido");
 	chiaki_mutex_fini(&g_host_mutex);
+	logprintf("trace: host_mutex fini (entra log_file_close)");
 	log_file_close();
+	trace("log_file_close VOLVIO");
 	swkbd_shutdown();
+	trace("swkbd cerrado");
 	FSShutdown();
+	trace("FSShutdown VOLVIO");
 	VPADShutdown();
 	audio_quit();
 	AXQuit();
+	trace("vpad/audio/AX cerrados");
 	WHBGfxShutdown();
+	trace("gfx cerrado (ultimo mensaje UDP)");
 	// Cerrar el socket UDP de log ANTES de desmontar la red de Cafe OS.
 	WHBLogUdpDeinit();
 	WHBLogCafeDeinit();

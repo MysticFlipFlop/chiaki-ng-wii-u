@@ -7,6 +7,7 @@
 //
 //   account_id=<16 hex>                       cuenta PSN global
 //   last_host=<ip>                            ultima consola conectada
+//   log_enabled=<0|1>                        log.txt en la SD (default 0)
 //   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>
 //
 // Una linea "console=" por consola guardada. El modulo solo serializa/
@@ -59,6 +60,11 @@ struct Config
 	// 100. Se ajusta con el slider que sale al mantener presionado el
 	// icono del micrófono durante la sesión.
 	int mic_gain_pct;
+	// Generacion del log.txt en la SD (gui-82): 0 = desactivado
+	// (default; al arrancar el log.txt existente se elimina), 1 =
+	// activado (append). Se alterna en Ajustes (fila Log.txt) y se
+	// persiste en config.ini.
+	int log_enabled;
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
 
