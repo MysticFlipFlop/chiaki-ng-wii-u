@@ -173,7 +173,6 @@ The compiled `.wuhb`/`.elf` binaries are output inside `build-wiiu/wiiu/`.
 - **No SHARE button**: left out on purpose, i hate that button
 - **No *pinch-zoom***: double-tap zoom is available, pinch is not.
 - **No gyroscope/motion**: it was implemented, tested on hardware, but i don't know how to translate gamepad gyro inputs to ds4 gyro inputs. The port does not send motion data. (it can be implemented in future updates)
-- Wi-Fi only: the Wii U has no Ethernet port of its own.
 - The Account ID is entered manually (base64) — there is no PSN login in the app.
 
 ## Credits and license
