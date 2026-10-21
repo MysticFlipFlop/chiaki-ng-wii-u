@@ -195,6 +195,12 @@ static volatile uint64_t g_video_frames = 0;
 static volatile uint64_t g_video_bytes = 0;
 static volatile uint64_t g_video_frames_lost = 0;
 static volatile uint64_t g_fec_failures = 0;
+// gui-104: episodio de FEC para no spamear el log — detalle
+// solo al primer frame perdido (o tras 10 s de calma) y
+// resumen cada 5 s mientras dure la tormenta de wifi.
+static uint32_t g_fec_win = 0; // frames en la ventana actual
+static uint64_t g_fec_win_t = 0; // inicio de la ventana
+static uint64_t g_fec_last_t = 0; // ultimo frame perdido
 static uint64_t g_video_log_ticks = 0;
 static uint64_t g_video_log_frames = 0;
 // Detector de estancamiento del decoder h264 (fase 3b: congelados con
@@ -213,6 +219,8 @@ static uint64_t g_stall_idr_sent_ticks = 0; // 0 = sin IDR pendiente
 static volatile uint64_t g_main_iters = 0;
 static uint64_t g_video_log_presented = 0;
 static uint64_t g_video_log_iters = 0;
+// gui-104: baseline de perdidas para el gating del log de video.
+static uint64_t g_video_log_lost = 0;
 
 // Zona táctil tipo touchpad de la PS4 (esquina superior derecha del
 // DRC). La GamePad solo tiene UN punto táctil, asi que va a un solo
@@ -1508,6 +1516,8 @@ static uint8_t g_rumble_l = 0, g_rumble_r = 0;
 static uint64_t g_rumble_t0 = 0;
 static bool g_rumble_on = false;
 static uint64_t g_rumble_issue_t = 0;
+// gui-104: tope del log de vibracion (1 linea / 2 s).
+static uint64_t g_rumble_log_t = 0;
 
 // Parada inmediata y silenciosa (casilla de Ajustes y salida al menu).
 static void wiiu_rumble_halt(void)
@@ -1535,8 +1545,14 @@ static void wiiu_rumble_frame(void)
 		if(!g_rumble_on)
 		{
 			g_rumble_on = true;
-			logprintf("Vibración: activa (izq=%u dcha=%u)",
-				  (unsigned)g_rumble_l, (unsigned)g_rumble_r);
+			// gui-104: tope de 1 linea / 2 s — los juegos que pulsan
+			// el motor llenaban el log de pares activa/parada.
+			if(now - g_rumble_log_t >= OSMillisecondsToTicks(2000))
+			{
+				g_rumble_log_t = now;
+				logprintf("Vibración: activa (izq=%u dcha=%u)",
+					(unsigned)g_rumble_l, (unsigned)g_rumble_r);
+			}
 		}
 		if(now - g_rumble_issue_t >=
 		   OSMillisecondsToTicks(RUMBLE_REFRESH_MS))
@@ -1552,7 +1568,11 @@ static void wiiu_rumble_frame(void)
 		g_rumble_l = g_rumble_r = 0;
 		g_rumble_on = false;
 		VPADStopMotor(VPAD_CHAN_0);
-		logprintf("Vibración: parada");
+		if(now - g_rumble_log_t >= OSMillisecondsToTicks(2000))
+		{
+			g_rumble_log_t = now;
+			logprintf("Vibración: parada");
+		}
 	}
 }
 
@@ -1583,11 +1603,38 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 		logprintf("Sesion: la PS4 pide PIN de acceso — introducelo con A");
 		break;
 	case CHIAKI_EVENT_VIDEO_FEC_FAILURE:
-		g_fec_failures++;
-		logprintf("Sesion: FEC — frame %d perdido (idr enviado=%d)",
-			     event->video_fec_failure.frame_index,
-			     (int)event->video_fec_failure.idr_request_sent);
-		break;
+	{
+			g_fec_failures++;
+			// gui-104: sin spam — el detalle solo abre episodio;
+			// durante la tormenta, resumen cada 5 s.
+			uint64_t now = OSGetTime();
+			bool fresh = (g_fec_win == 0 ||
+				      now - g_fec_last_t >
+					      OSMillisecondsToTicks(10000));
+			g_fec_last_t = now;
+			if(fresh)
+			{
+				g_fec_win = 1;
+				g_fec_win_t = now;
+				logprintf("Sesion: FEC — frame %d perdido (idr enviado=%d)",
+					  event->video_fec_failure.frame_index,
+					  (int)event->video_fec_failure.idr_request_sent);
+			}
+			else
+			{
+				g_fec_win++;
+				if(now - g_fec_win_t >= OSMillisecondsToTicks(5000))
+				{
+					logprintf("Sesion: FEC — %u frames perdidos en 5 s"
+						  " (total %llu)",
+						  g_fec_win,
+						  (unsigned long long)g_fec_failures);
+					g_fec_win = 1;
+					g_fec_win_t = now;
+				}
+			}
+			break;
+	}
 	case CHIAKI_EVENT_QUIT:
 		if(event->quit.reason_str)
 			logprintf("Sesion terminada: %s (%s)",
@@ -2102,8 +2149,12 @@ static bool start_session()
 	g_video_bytes = 0;
 	g_video_frames_lost = 0;
 	g_fec_failures = 0;
+	g_fec_win = 0;
+	g_fec_win_t = 0;
+	g_fec_last_t = 0;
 	g_video_log_ticks = OSGetTime();
 	g_video_log_frames = 0;
+	g_video_log_lost = 0;
 	// Micrófono (gui-67): toda sesión arranca con el icono en
 	// silenciado; el hardware y el encoder se cierran en la parada.
 	g_mic_wanted = false;
@@ -2612,7 +2663,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-103"
+#define APP_BUILD_TAG "gui-104"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4505,26 +4556,9 @@ static uint32_t gui96_acq_post(void *)
 	return 0;
 }
 
-// gui-98: hash FNV-1a sobre el inicio de un buffer de color. Se
-// invalida la cache CPU antes (el GPU acaba de escribir; el muestreo
-// es al inicio de la vuelta, con GX2DrawDone del FinishRender
-// anterior ya cumplido = GPU en reposo, sin carril).
-static uint32_t gui98_bufhash(const void *p, uint32_t n)
-{
-	if(!p)
-		return 0;
-	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, (void *)p, n);
-	const uint8_t *b = (const uint8_t *)p;
-	uint32_t h = 2166136261u;
-	for(uint32_t i = 0; i < n; i++)
-		h = (h ^ b[i]) * 16777619u;
-	return h;
-}
-
-// Telemetria del bucle (gui-96): transiciones + contadores a 1 Hz.
+// Transiciones de primer plano (gui-96/104). El latido 1 Hz con
+// los hashes gui-98 se retiro en gui-104 (spam de log.txt).
 static bool g_pui_fg_prev = true;
-static uint64_t g_pui_log_t = 0;
-static uint32_t g_pui_loop_iters = 0;
 
 int main(int argc, char **argv)
 {
@@ -4637,9 +4671,10 @@ int main(int argc, char **argv)
 	while(WHBProcIsRunning())
 	{
 		g_main_iters++;
-		// gui-96: transiciones de primer plano y telemetria de
-		// swap a 1 Hz (diagnostico del freeze tras Resume).
-		g_pui_loop_iters++;
+		// gui-96/104: transiciones de primer plano
+		// (event-driven). El latido 1 Hz con hashes gui-98 se
+		// retiro en gui-104: era la mayor fuente de spam del
+		// log.txt (8.6 MB/dia).
 		{
 			bool fg = ProcUIInForeground();
 			if(fg != g_pui_fg_prev)
@@ -4648,29 +4683,6 @@ int main(int argc, char **argv)
 					  fg ? "BACKGROUND->FOREGROUND"
 					     : "FOREGROUND->BACKGROUND");
 				g_pui_fg_prev = fg;
-			}
-			uint64_t now = OSGetTime();
-			if(now - g_pui_log_t >= OSMillisecondsToTicks(1000))
-			{
-				g_pui_log_t = now;
-				uint32_t sc = 0, fc = 0;
-				OSTime lf = 0, lv = 0;
-				GX2GetSwapStatus(&sc, &fc, &lf, &lv);
-				const GX2ColorBuffer *tvb =
-					WHBGfxGetTVColourBuffer();
-				const GX2ColorBuffer *drcb =
-					WHBGfxGetDRCColourBuffer();
-				logprintf("ProcUI: fg=%s loop/s=%u swap=%u"
-					  " flip=%u vsync=%d tvh=%08x"
-					  " drch=%08x",
-					  fg ? "si" : "no",
-					  (unsigned)g_pui_loop_iters, sc, fc,
-					  g_config.vsync,
-					  gui98_bufhash(tvb->surface.image,
-							 262144),
-					  gui98_bufhash(drcb->surface.image,
-							 65536));
-				g_pui_loop_iters = 0;
 			}
 		}
 		// Vuelco del log a la SD en lotes (el handler solo encola):
@@ -5697,6 +5709,7 @@ int main(int argc, char **argv)
 			}
 			if(now - g_video_log_ticks > OSSecondsToTicks(3))
 			{
+				g_video_log_ticks = now;
 				if(frames != g_video_log_frames)
 				{
 					WiiUVideoStats vs = wiiu_video_stats();
@@ -5707,67 +5720,73 @@ int main(int argc, char **argv)
 					// "+6148914691236517071/s". Se trata
 					// como reinicio (delta 0).
 					const unsigned long long dp =
-						(vs.presented >=
-						 g_video_log_presented)
-							? (unsigned long long)(
-								  vs.presented -
-								  g_video_log_presented)
+						(vs.presented >= g_video_log_presented)
+							? (unsigned long long)(vs.presented -
+									   g_video_log_presented)
 							: 0;
-					logprintf(
-						"Video: %llu frames (%.2f MB) perdidos=%llu "
-						"FEC_fallos=%llu | hw_dec=%llu err=%llu drop=%llu "
-						"exec=%uus lock=%uus mem=%uus | present=%llu "
-						"(+%llu/s) upload=%uus age=%uus loop=%llu (+%llu/s)",
-						(unsigned long long)frames,
-						(double)g_video_bytes / (1024.0 * 1024.0),
-						(unsigned long long)g_video_frames_lost,
-						(unsigned long long)g_fec_failures,
-						(unsigned long long)vs.decoded,
-						(unsigned long long)vs.errors,
-						(unsigned long long)vs.dropped,
-						(unsigned int)vs.exec_us,
-						(unsigned int)vs.lock_us,
-						(unsigned int)vs.mem_us,
-						(unsigned long long)vs.presented,
-						(unsigned long long)(dp / 3),
-						(unsigned int)vs.upload_us,
-						(unsigned int)vs.age_us,
-						(unsigned long long)g_main_iters,
-						(unsigned long long)((g_main_iters -
-								      g_video_log_iters) /
-							     3));
+					// gui-104: perdidas y vueltas se miden por
+					// ventana y los baselines se avanzan siempre;
+					// la linea solo se emite si hubo perdidas (antes
+					// salia cada 3 s fijo — spam en sesion sana).
+					unsigned long long lost_d =
+						(unsigned long long)g_video_frames_lost -
+						g_video_log_lost;
+					unsigned long long loop_d =
+						(g_main_iters - g_video_log_iters) / 3;
 					g_video_log_frames = frames;
 					g_video_log_presented = vs.presented;
 					g_video_log_iters = g_main_iters;
+					g_video_log_lost =
+						(unsigned long long)g_video_frames_lost;
+					if(lost_d)
+						logprintf(
+							"Video: %llu frames (%.2f MB) perdidos=%llu "
+							"FEC_fallos=%llu | hw_dec=%llu err=%llu drop=%llu "
+							"exec=%uus lock=%uus mem=%uus | present=%llu "
+							"(+%llu/s) upload=%uus age=%uus loop=%llu (+%llu/s)",
+							(unsigned long long)frames,
+							(double)g_video_bytes / (1024.0 * 1024.0),
+							(unsigned long long)g_video_frames_lost,
+							(unsigned long long)g_fec_failures,
+							(unsigned long long)vs.decoded,
+							(unsigned long long)vs.errors,
+							(unsigned long long)vs.dropped,
+							(unsigned int)vs.exec_us,
+							(unsigned int)vs.lock_us,
+							(unsigned int)vs.mem_us,
+							(unsigned long long)vs.presented,
+							(unsigned long long)(dp / 3),
+							(unsigned int)vs.upload_us,
+							(unsigned int)vs.age_us,
+							(unsigned long long)g_main_iters,
+							(unsigned long long)loop_d);
 				}
-				g_video_log_ticks = now;
-				// Telemetria de tactil (gui-64): rebotes y
-				// picos del sensor en la zona del touchpad.
-				// Al mantener el dedo, ends>>0 = el sensor
-				// rebota; spikes/maxjump = picos de posicion
-				// (px de zona, sin amplificar al pad).
-				logprintf(
-					"Touch: begins=%u ends=%u spikes=%u maxjump=%u px pos=(%u,%u) down=%d",
-					g_touch_begins, g_touch_ends,
-					g_touch_spikes, g_touch_maxjump,
-					(unsigned)g_tp_x, (unsigned)g_tp_y,
-					g_tp_down ? 1 : 0);
+				// gui-104 (tactil gui-64): solo con actividad en la
+				// ventana — antes era una linea de ceros cada 3 s.
+				if(g_touch_begins || g_touch_ends ||
+				   g_touch_spikes || g_touch_maxjump)
+					logprintf(
+						"Touch: begins=%u ends=%u spikes=%u maxjump=%u px pos=(%u,%u) down=%d",
+						g_touch_begins, g_touch_ends,
+						g_touch_spikes, g_touch_maxjump,
+						(unsigned)g_tp_x, (unsigned)g_tp_y,
+						g_tp_down ? 1 : 0);
 				g_touch_begins = 0;
 				g_touch_ends = 0;
 				g_touch_spikes = 0;
 				g_touch_maxjump = 0;
-				// Telemetría del micrófono (gui-67):
-				// entradas/s confirma la tasa del sistema
-				// (32000) y el pico responde a la voz — sin
-				// una línea por segundo de ruido.
+				// gui-104 (micro gui-67): solo loguea si hubo voz
+				// (pico>0) en la ventana — el estado activo/
+				// silenciado ya lo dicen sus eventos de conmutacion.
 				if(g_mic_hw_open)
 				{
-					logprintf("Mic: entradas=%u/s peak=%d %s",
-						  g_mic_consumed_win / 3,
-						  g_mic_peak_win,
-						  g_mic_wanted && !g_mic_muted
-							  ? "activo"
-							  : "silenciado");
+					if(g_mic_peak_win)
+						logprintf("Mic: entradas=%u/s peak=%d %s",
+							  g_mic_consumed_win / 3,
+							  g_mic_peak_win,
+							  g_mic_wanted && !g_mic_muted
+								  ? "activo"
+								  : "silenciado");
 					g_mic_consumed_win = 0;
 					g_mic_peak_win = 0;
 				}

@@ -341,6 +341,7 @@ void audio_session_start(void)
 	if(!g_inited || !g_voice[0] || !g_voice[1])
 		return;
 	OSLockMutex(&g_lock);
+	audio_log("Audio: sink de audio listo (arranca la sesion)");
 	memset(g_ax_ring, 0, sizeof(g_ax_ring));
 	DCFlushRange(g_ax_ring, sizeof(g_ax_ring));
 	g_stage_r = 0;
@@ -611,24 +612,28 @@ void audio_update(void)
 		DCFlushRange(g_ax_ring, sizeof(g_ax_ring));
 	}
 
-	// Diagnostico cada 3 s mientras hay sesion: playhead efectivo y
-	// el offset crudo del DSP.
+	// gui-104: ventana de 3 s SOLO para eventos — antes la salud
+	// se registraba cada 3 s aunque nada fallara. Ahora solo hay
+	// linea si hubo underruns o resync en la ventana; el pico
+	// se reinicia igual cada ventana.
 	uint64_t now = OSGetTime();
 	if(now - g_underrun_log_ticks > OSSecondsToTicks(3))
 	{
 		g_underrun_log_ticks = now;
 		uint32_t peak = g_peak_src;
 		g_peak_src = 0;
-		audio_log(
-			"Audio: play=%u dsp=%u running=%d fill=%u recv=%u underruns=+%u resync=+%u peak=%u",
-			(unsigned int)play, (unsigned int)dsp_off,
-			(int)AXIsVoiceRunning(g_voice[0]),
-			(unsigned int)g_fill, (unsigned int)g_stage_w,
-			(unsigned int)(g_underruns - g_underruns_logged),
-			(unsigned int)(g_resync_dropped - g_resync_logged),
-			(unsigned int)peak);
+		uint32_t du = g_underruns - g_underruns_logged;
+		uint32_t dr = g_resync_dropped - g_resync_logged;
 		g_underruns_logged = g_underruns;
 		g_resync_logged = g_resync_dropped;
+		if(du || dr)
+			audio_log(
+				"Audio: play=%u dsp=%u running=%d fill=%u recv=%u underruns=+%u resync=+%u peak=%u",
+				(unsigned int)play, (unsigned int)dsp_off,
+				(int)AXIsVoiceRunning(g_voice[0]),
+				(unsigned int)g_fill, (unsigned int)g_stage_w,
+				(unsigned int)du, (unsigned int)dr,
+				(unsigned int)peak);
 	}
 	OSUnlockMutex(&g_lock);
 }
