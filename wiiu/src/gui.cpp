@@ -92,6 +92,25 @@
 
 #define MAX_VERTS 4096 //1024 quads por frame (el menu usa ~500)
 
+// Pool rotativo de buffers de vertices del GUI (gui-100). La
+// rotacion es POR FLUSH y no por frame: GX2 es asincrono y no
+// ejecuta los comandos hasta el GX2Flush de cierre de frame
+// (WHBGfxFinishRender), asi que si dos gui_flush del MISMO
+// frame toman el mismo slot, el segundo pisa la geometria del
+// primero antes de que la GPU la lea. Con 3 slots eso pasaba
+// en los frames de 4-5 flushes y el dibujo 1 (siempre el de
+// la TV, que se dibuja primera) se ejecutaba con los vertices
+// del ultimo batch: coords DRC 854x480 proyectadas en
+// 1920x1080 = miniatura arriba a la izquierda en la TV. De ahi
+// el "duplicado" de Ajustes en la TV durante la animacion
+// (gui-80) y la tarjeta Conectando deshecha con la C perdida
+// ("onectando") durante la conexion; la GamePad, dibujada la
+// ultima, nunca sufria el robo. Maximo real de flushes por
+// frame: animacion de menu = 4 (base+hoja, TV y DRC),
+// conexion = 5 (conectar TV/DRC + parar + micro + touchpad):
+// 8 slots dejan holgura.
+#define GUI_VBUF_SLOTS 8
+
 struct GuiVert
 {
 	float x, y;
@@ -106,7 +125,7 @@ static GX2FetchShader s_fetch;
 static void *s_fetch_prog;
 static GX2Sampler s_samp;
 static GX2Texture s_font;
-static GX2RBuffer s_vbuf[3];
+static GX2RBuffer s_vbuf[GUI_VBUF_SLOTS];
 static int s_slot;
 
 // Batch CPU (main thread)
@@ -418,12 +437,16 @@ bool gui_init(void)
 	if(!font_create())
 		return false;
 
-	// Triada de buffers de vertices (cada frame escribe uno distinto).
-	for(int i = 0; i < 3; i++)
+	// Pool de buffers de vertices (cada gui_flush escribe uno
+	// distinto; ver GUI_VBUF_SLOTS). FORCE_MEM2 como en el
+	// atlas: con los scan buffers de la TV ocupando MEM1 no
+	// queremos que la creacion de 8 buffers falle por espacio.
+	for(int i = 0; i < GUI_VBUF_SLOTS; i++)
 	{
 		memset(&s_vbuf[i], 0, sizeof(s_vbuf[i]));
 		s_vbuf[i].flags = GX2R_RESOURCE_BIND_VERTEX_BUFFER |
-				  GX2R_RESOURCE_USAGE_CPU_WRITE;
+				  GX2R_RESOURCE_USAGE_CPU_WRITE |
+				  GX2R_RESOURCE_USAGE_FORCE_MEM2;
 		s_vbuf[i].elemSize = sizeof(GuiVert);
 		s_vbuf[i].elemCount = MAX_VERTS;
 		if(!GX2RCreateBuffer(&s_vbuf[i]))
@@ -717,10 +740,12 @@ void gui_flush(void)
 	if(s_nv & 3)
 		return; // por construccion son multiplos de4
 
-	// Escribimos un buffer rotativo distinto cada frame: el anterior
-	// puede seguir en lectura por el GPU (GX2 asincrono, sin DrawDone).
+	// Buffer rotativo distinto POR FLUSH: el anterior puede seguir en
+	// lectura por el GPU (GX2 asincrono, sin DrawDone) hasta el
+	// GX2Flush de cierre de frame; por eso el pool cubre todos los
+	// flushes de un frame (ver GUI_VBUF_SLOTS).
 	int slot = s_slot;
-	s_slot = (s_slot + 1) % 3;
+	s_slot = (s_slot + 1) % GUI_VBUF_SLOTS;
 	void *p = GX2RLockBufferEx(&s_vbuf[slot], GX2R_RESOURCE_BIND_NONE);
 	if(!p)
 		return;
