@@ -74,6 +74,8 @@ void config_init(Config *cfg)
 	cfg->vsync = 1; // default: vsync activado (gui-59)
 	cfg->mic_gain_pct = 100; // default: captura al 100% (gui-67)
 	cfg->log_enabled = 0; // default: log.txt desactivado (gui-82)
+	cfg->vibration_enabled = 1; // default: vibracion activada (gui-93)
+	cfg->mando_mode = 0; // default: modo mando desactivado (gui-102)
 }
 
 int config_find(const Config *cfg, const char *host)
@@ -155,10 +157,11 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 		return 0;
 
 	size_t off = (size_t)snprintf(buf, buf_size,
-				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\nvsync=%d\nmic_gain=%d\nlog_enabled=%d\n",
+				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\nvsync=%d\nmic_gain=%d\nlog_enabled=%d\nvibration_enabled=%d\nmando_mode=%d\n",
 				      cfg->account_id_hex, cfg->last_host,
 				      cfg->video_preset, cfg->vsync,
-				      cfg->mic_gain_pct, cfg->log_enabled);
+				      cfg->mic_gain_pct, cfg->log_enabled,
+				      cfg->vibration_enabled, cfg->mando_mode);
 	if(off >= buf_size)
 		off = buf_size - 1;
 
@@ -280,6 +283,10 @@ void config_parse(Config *cfg, const char *buf, size_t len)
 				}
 				else if(!strcmp(key, "log_enabled"))
 					cfg->log_enabled = atoi(val) ? 1 : 0;
+				else if(!strcmp(key, "vibration_enabled"))
+					cfg->vibration_enabled = atoi(val) ? 1 : 0;
+				else if(!strcmp(key, "mando_mode"))
+					cfg->mando_mode = atoi(val) ? 1 : 0;
 				else if(!strcmp(key, "console"))
 					parse_console_line(cfg, val, line_end);
 				// claves desconocidas: se ignoran (compatibilidad
