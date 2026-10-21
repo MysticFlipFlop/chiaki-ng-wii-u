@@ -159,6 +159,9 @@ static char g_regist_target_host[CONFIG_HOST_SIZE]; // host del regist en curso
 // elegir sin ciclar uno a uno.
 static bool g_qual_menu_open = false;
 static int g_qual_menu_sel = 0;
+// Menu contextual del Modo (gui-103): presets de stream.
+static bool g_mando_menu_open = false;
+static int g_mando_menu_sel = 0;
 
 // Dialogo modal de confirmacion de borrado (solo desde Ajustes): sin
 // navegacion — A confirma y B vuelve (como los dialogs de consola).
@@ -173,10 +176,12 @@ static RegistState g_regist_state = RegistState::Idle;
 static ChiakiSession g_session;
 static bool g_session_active = false;
 static volatile bool g_session_quit_received = false;
-// Modo mando (gui-102): sesion viva pero sin stream (la consola
-// no manda audio ni video y aqui no se dibuja ni se reproduce
-// nada). Mando, táctil, micrófono y vibración siguen igual.
-static bool g_mando_session = false;
+// Modo de sesión (gui-102/103): bits CHIAKI_*_DISABLED del preset
+// que manda al abrir la sesión. Sin vídeo no se sube ni se dibuja
+// nada; sin audio no se reproduce el downlink. Mando, táctil,
+// micrófono y vibración siguen igual en todos.
+static ChiakiDisableAudioVideo g_av_disabled =
+	CHIAKI_NONE_DISABLED;
 // Handshake terminado (CHIAKI_EVENT_CONNECTED): en modo mando
 // cambia la tarjeta de "Conectando" a la de estado.
 static bool g_session_connected = false;
@@ -1559,9 +1564,9 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	case CHIAKI_EVENT_CONNECTED:
 		logprintf("Sesion: conectada (session request OK)");
 		g_session_connected = true;
-		if(g_mando_session)
+		if(g_av_disabled & CHIAKI_VIDEO_DISABLED)
 		{
-			// Modo mando (gui-102): sin frames de video, el
+			// Modo sin vídeo (gui-102/103): sin frames, el
 			// surface del touchpad se muestra aqui (misma
 			// ventana de 2 s que con el primer frame).
 			g_tp_stream_seen = true;
@@ -1698,6 +1703,34 @@ static const char *video_preset_label(int idx)
 				       ? idx
 				       : 0]
 		.label;
+}
+
+// Presets del Modo (gui-103): etiqueta corta para la fila y el
+// menu. Valor guardado en config.ini: 0 = normal, 1 = sin audio
+// ni vídeo (mando puro, el primero que hubo), 2 = sin vídeo
+// (solo audio + mando).
+static const int MANDO_MODES = 3;
+static const int g_mando_menu_vals[3] = { 0, 2, 1 };
+
+static const char *mando_mode_label(int mode)
+{
+	if(mode == 1)
+		return "Sin vídeo/audio";
+	if(mode == 2)
+		return "Sin vídeo";
+	return "Normal";
+}
+
+// Bits del protocolo (takion.h) del preset guardado: la consola
+// deja de enviar lo apagado (ahorra WiFi y CPU de decode) y aquí
+// no se dibuja ni se reproduce nada de eso.
+static ChiakiDisableAudioVideo mando_av_mode(int mode)
+{
+	if(mode == 1)
+		return CHIAKI_AUDIO_VIDEO_DISABLED;
+	if(mode == 2)
+		return CHIAKI_VIDEO_DISABLED;
+	return CHIAKI_NONE_DISABLED;
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,22 +2031,25 @@ static bool start_session()
 	info.video_profile_auto_downgrade = true;
 	info.enable_keyboard = false;
 	info.enable_dualsense = false;
-	// Modo mando (gui-102): sin stream — la consola no manda ni
-	// audio ni video (el protocolo lo admite) y el GamePad queda
-	// como mando puro.
-	g_mando_session = (g_config.mando_mode != 0);
-	info.audio_video_disabled = g_mando_session
-				       ? CHIAKI_AUDIO_VIDEO_DISABLED
-				       : CHIAKI_NONE_DISABLED;
+	// Modo (gui-102/103): preset elegido en Ajustes — la consola
+	// no manda vídeo, no manda audio, o lo manda todo (el
+	// protocolo lo admite; ahorra WiFi y CPU de decode).
+	g_av_disabled = mando_av_mode(g_config.mando_mode);
+	info.audio_video_disabled = g_av_disabled;
 	info.auto_regist = false;
 	info.packet_loss_max = 0.05; // tope de perdida reportada al servidor
 	info.enable_idr_on_fec_failure = true;
 	memcpy(info.psn_account_id, g_psn_account_id, sizeof(info.psn_account_id));
 
 	snprintf(g_session_ip, sizeof(g_session_ip), "%s", host);
-	if(g_mando_session)
-		logprintf("Sesion: modo mando — sin stream"
-			  " (audio/video desactivados en protocolo)");
+	if(g_av_disabled == CHIAKI_AUDIO_VIDEO_DISABLED)
+		logprintf("Sesion: modo %s — sin audio ni vídeo"
+			  " (desactivados en protocolo)",
+			  mando_mode_label(g_config.mando_mode));
+	else if(g_av_disabled == CHIAKI_VIDEO_DISABLED)
+		logprintf("Sesion: modo %s — solo audio"
+			  " (vídeo desactivado en protocolo)",
+			  mando_mode_label(g_config.mando_mode));
 	logprintf("Sesion: conectando con %s (req_port %u informativo, chiaki usa 9295)",
 		     host, (unsigned int)req_port);
 
@@ -2045,7 +2081,7 @@ static bool start_session()
 	ChiakiAudioSink audio_sink = {};
 	chiaki_opus_decoder_get_sink(&g_opus_decoder, &audio_sink);
 	chiaki_session_set_audio_sink(&g_session, &audio_sink);
-	if(!g_mando_session) // sin downlink en modo mando (gui-102)
+	if(!(g_av_disabled & CHIAKI_AUDIO_DISABLED)) // gui-102/103
 		audio_session_start();
 
 	err = chiaki_session_start(&g_session);
@@ -2129,7 +2165,7 @@ static void stop_session(bool skip_gpu_wait = false)
 	g_session_active = false;
 	g_session_login_pin_requested = false;
 	g_session_connected = false;
-	g_mando_session = false;
+	g_av_disabled = CHIAKI_NONE_DISABLED;
 	logprintf("Sesion finalizada");
 }
 
@@ -2576,7 +2612,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-102"
+#define APP_BUILD_TAG "gui-103"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2636,18 +2672,17 @@ static void draw_connecting(int w, int h)
 	gui_flush();
 }
 
-// Tarjeta del modo mando (gui-102): solo en la GamePad (la TV
+// Tarjeta del modo (gui-102/103): solo en la GamePad (la TV
 // queda negra: el jugador mira su consola). Avisa de que la
 // sesion esta viva y que este GamePad es el mando; los iconos
 // de parar y microfono y el touchpad siguen encima, igual que
-// en cualquier sesion.
-static void draw_mando_card(int w, int h)
+// en cualquier sesion. El subtitulo lo fija el preset.
+static void draw_mando_card(int w, int h, const char *sub)
 {
 	int scale = (w >= 1280) ? 2 : 1;
 	int u = 8 * scale;
 
 	const char *title = "Modo mando activo";
-	const char *sub = "El video esta en tu consola";
 
 	gui_begin(w, h);
 
@@ -3256,9 +3291,16 @@ static void settings_scroll_reset(void)
 }
 
 // Paso de fisica por frame (lo llama draw_menu; la segunda superficie
-// del frame - TV y DRC - entra con dt~0 y no hace nada).
+// del frame - TV y DRC - entra con dt~0 y no hace nada). gui-103: la
+// superficie que cabe entera (la TV con 8 filas) NO toca
+// el estado compartido — su scroll_px = fraccion *
+// max_px(0) = 0 y dibuja la lista fija; la que necesita
+// scroll (la DRC, 52 px con 8 filas) anima el muelle con
+// dt real en su propia llamada.
 static void settings_scroll_step(int w, int h)
 {
+	if(settings_max_px(w, h) <= 0.f)
+		return;
 	uint64_t now = OSGetTime();
 	float dt = (float)((double)(now - g_set_scroll_t) /
 			   (double)OSMillisecondsToTicks(1)) * 0.001f;
@@ -3268,14 +3310,7 @@ static void settings_scroll_step(int w, int h)
 	if(dt > 0.05f)
 		dt = 0.05f;
 
-	float max_px = settings_max_px(w, h);
-	if(max_px <= 0.f)
-	{
-		g_set_scroll = 0.f;
-		g_set_scroll_vel = 0.f;
-		g_set_scroll_on = false;
-	}
-	else if(!g_set_dragging)
+	if(!g_set_dragging)
 	{
 		if(g_set_scroll_on)
 		{
@@ -3351,14 +3386,14 @@ static uint32_t c_mul_a(uint32_t c, float a)
 // con titulo y lista; compartida por el dibujo (TV y DRC) y el tactil
 // del DRC (854x480). Filas mas compactas en la TV para que quepan los
 // presets en 720.
-static void quality_menu_geom(int w, int h, int *px, int *py, int *pw,
-			      int *ph, int *row_h)
+static void preset_menu_geom(int w, int h, int rows, int *px, int *py,
+			      int *pw, int *ph, int *row_h)
 {
 	int scale = (w >= 1280) ? 2 : 1;
 	int u = 8 * scale;
 	*pw = u * 22;
 	*row_h = (scale == 2) ? u * 3 : u * 4;
-	*ph = u * 4 + *row_h * VIDEO_PRESET_COUNT + u * 3;
+	*ph = u * 4 + *row_h * rows + u * 3;
 	*px = (w - *pw) / 2;
 	*py = (h - *ph) / 2;
 }
@@ -3437,17 +3472,39 @@ static void settings_toggle_vibration(void)
 		  g_config.vibration_enabled ? "activada" : "desactivada");
 }
 
-// Modo mando (gui-102): desactiva el stream de la sesion — la
-// consola no manda audio ni video y el GamePad queda como mando
-// puro (más táctil, micrófono y vibración). Aplica en la próxima
-// sesión.
-static void settings_toggle_mando(void)
+// Menu contextual del Modo (gui-103): mueve la seleccion con
+// wrap, igual que el de Calidad.
+static void mando_menu_move(int dir)
 {
-	g_config.mando_mode = g_config.mando_mode ? 0 : 1;
+	g_mando_menu_sel = (g_mando_menu_sel + dir + MANDO_MODES) %
+			   MANDO_MODES;
+}
+
+// Menu contextual del Modo (gui-103): aplica el preset marcado y
+// cierra — como en Calidad, solo guarda: el protocolo se negocia
+// al abrir la próxima sesión.
+static void mando_menu_apply(void)
+{
+	g_config.mando_mode = g_mando_menu_vals[g_mando_menu_sel];
 	g_config_dirty = true;
-	logprintf("Modo mando: %s (persiste en config.ini, aplica en"
-		  " la próxima sesión)",
-		  g_config.mando_mode ? "activado" : "desactivado");
+	logprintf("Modo: %s (aplica en la próxima sesión)",
+		  mando_mode_label(g_config.mando_mode));
+	g_mando_menu_open = false;
+}
+
+// Cicla el preset del Modo con ←/→ sobre la fila, como la de
+// Calidad (solo guarda; aplica al reconectar).
+static void settings_cycle_mando(int dir)
+{
+	int idx = 0;
+	for(int i = 0; i < MANDO_MODES; i++)
+		if(g_mando_menu_vals[i] == g_config.mando_mode)
+			idx = i;
+	idx = (idx + dir + MANDO_MODES) % MANDO_MODES;
+	g_config.mando_mode = g_mando_menu_vals[idx];
+	g_config_dirty = true;
+	logprintf("Modo: %s (aplica en la próxima sesión)",
+		  mando_mode_label(g_config.mando_mode));
 }
 
 // Accion de una fila de Ajustes (A o toque en el DRC).
@@ -3491,7 +3548,17 @@ static void settings_activate(int row)
 	else if(row == SET_ROW_VIBRATION)
 		settings_toggle_vibration();
 	else if(row == SET_ROW_MANDO)
-		settings_toggle_mando();
+	{
+		// Menu contextual (gui-103), como el de Calidad:
+		// arranca marcado el actual y B cierra sin tocar nada.
+		g_mando_menu_sel = 0;
+		for(int i = 0; i < MANDO_MODES; i++)
+			if(g_mando_menu_vals[i] == g_config.mando_mode)
+				g_mando_menu_sel = i;
+		g_mando_menu_open = true;
+		logprintf("Modo: abrir presets (Normal / Sin vídeo /"
+			  " Sin vídeo/audio)");
+	}
 	else if(row == SET_ROW_DELETE)
 	{
 		// Ultima fila de Ajustes. Cierra Ajustes (el dialogo
@@ -3814,8 +3881,9 @@ static void draw_menu(int w, int h)
 			}
 			else if(i == SET_ROW_MANDO)
 			{
-				label = "Modo mando";
-				value[0] = '\0'; // estado: checkbox, sin texto
+				label = "Modo";
+				snprintf(value, sizeof(value), "%s",
+					 mando_mode_label(g_config.mando_mode));
 			}
 			else
 			{
@@ -3855,16 +3923,14 @@ static void draw_menu(int w, int h)
 			// gui-93 Vibracion): rellena en accent con ✓ si activo,
 			// solo borde si no.
 			if(i == SET_ROW_VSYNC || i == SET_ROW_LOG ||
-			   i == SET_ROW_VIBRATION || i == SET_ROW_MANDO)
+			   i == SET_ROW_VIBRATION)
 			{
 				bool on = (i == SET_ROW_VSYNC)
 						  ? (g_config.vsync != 0)
 						  : (i == SET_ROW_LOG)
 							    ? (g_config.log_enabled != 0)
-							    : (i == SET_ROW_VIBRATION)
-							    	? (g_config.vibration_enabled !=
-							    	   0)
-							    : (g_config.mando_mode != 0);
+							    : (g_config.vibration_enabled !=
+							    	   0);
 				float cb = (float)(u * 3 / 2); // 12 / 24 px
 				float cbx = (float)(w - m - u * 2) - cb;
 				float cby = (float)y +
@@ -3917,7 +3983,7 @@ static void draw_menu(int w, int h)
 
 		// Sin hint de Ajustes con el menu de presets abierto: su
 		// propio hint ocupa esa linea (evita texto doble).
-		if(!g_qual_menu_open)
+		if(!g_qual_menu_open && !g_mando_menu_open)
 		{
 			const char *hint =
 				"↑/↓: elegir   A o tocar: abrir   B: volver";
@@ -3933,7 +3999,8 @@ static void draw_menu(int w, int h)
 		if(g_qual_menu_open)
 		{
 			int px, py, pw, ph, mrow;
-			quality_menu_geom(w, h, &px, &py, &pw, &ph, &mrow);
+			preset_menu_geom(w, h, VIDEO_PRESET_COUNT, &px, &py,
+					  &pw, &ph, &mrow);
 			gui_rect(0.f, 0.f, (float)w, (float)h,
 				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
 			gui_rect((float)px, (float)py, (float)pw, (float)ph,
@@ -3968,6 +4035,50 @@ static void draw_menu(int w, int h)
 				((float)w - gui_text_width(qhint, scale)) /
 					2.f,
 				(float)(h - u * 2), qhint, c_text3, scale);
+		}
+
+		// Menu contextual del Modo (gui-103): mismo panel que
+		// el de Calidad con los tres presets de stream.
+		if(g_mando_menu_open)
+		{
+			int px, py, pw, ph, mrow;
+			preset_menu_geom(w, h, MANDO_MODES, &px, &py, &pw,
+					  &ph, &mrow);
+			gui_rect(0.f, 0.f, (float)w, (float)h,
+				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
+			gui_rect((float)px, (float)py, (float)pw, (float)ph,
+				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
+			gui_text((float)(px + u * 2), (float)(py + u * 2),
+				 "Modo", c_text, scale);
+			for(int i = 0; i < MANDO_MODES; i++)
+			{
+				int val = g_mando_menu_vals[i];
+				int ry = py + u * 4 + i * mrow;
+				if(i == g_mando_menu_sel)
+				{
+					gui_rect((float)px, (float)ry,
+						 (float)pw, (float)mrow,
+						 GUI_RGBA(0x00, 0xa7, 0xff,
+							  0x59));
+					gui_rect((float)px, (float)ry,
+						 (float)(u / 2),
+						 (float)mrow, c_accent);
+				}
+				int ty = ry + (mrow - u) / 2;
+				gui_text((float)(px + u * 2), (float)ty,
+					 mando_mode_label(val), c_text,
+					 scale);
+				if(val == g_config.mando_mode)
+					gui_text((float)(px + pw - u * 3),
+						 (float)ty, "✓",
+						 c_accent, scale);
+			}
+			const char *mhint =
+				"↑/↓: elegir   A: elegir   B: cerrar";
+			gui_text(
+				((float)w - gui_text_width(mhint, scale)) /
+					2.f,
+				(float)(h - u * 2), mhint, c_text3, scale);
 		}
 		gui_flush();
 		return;
@@ -4633,11 +4744,12 @@ int main(int argc, char **argv)
 				// no desencadenar acciones fantasma al volver. Parar es
 				// el icono táctil; mientras dure la conexion (aun sin
 				// frames) manda la tarjeta: B cancela.
-				// gui-102: en modo mando tambien es mando puro
-				// (sin frames) desde el principio.
+				// gui-102/103: sin vídeo transmitido (preset
+				// Modo) es mando puro desde el principio.
 				bool streaming = g_session_active &&
 						 (g_video_frames > 0 ||
-						  g_mando_session);
+						  (g_av_disabled &
+						   CHIAKI_VIDEO_DISABLED));
 
 				if(streaming)
 					last_hold = status.hold;
@@ -4712,6 +4824,29 @@ int main(int argc, char **argv)
 							VPAD_BUTTON_A)
 							quality_menu_apply();
 					}
+					else if(g_mando_menu_open)
+					{
+						if(rising & VPAD_BUTTON_B)
+						{
+							g_mando_menu_open =
+								false;
+							logprintf(
+								"Modo: menu cerrado");
+						}
+						else if(rising &
+							(VPAD_BUTTON_DOWN |
+							 VPAD_BUTTON_RIGHT |
+							 VPAD_BUTTON_ZR))
+							mando_menu_move(1);
+						else if(rising &
+							(VPAD_BUTTON_UP |
+							 VPAD_BUTTON_LEFT |
+							 VPAD_BUTTON_ZL))
+							mando_menu_move(-1);
+						else if(rising &
+							VPAD_BUTTON_A)
+							mando_menu_apply();
+					}
 					// Fase 4c: en Ajustes las teclas del
 					// menu quedan consumidas; B cierra.
 					else if(rising & VPAD_BUTTON_B)
@@ -4749,7 +4884,11 @@ int main(int argc, char **argv)
 						else if(g_set_sel == SET_ROW_VIBRATION)
 							settings_toggle_vibration();
 						else if(g_set_sel == SET_ROW_MANDO)
-							settings_toggle_mando();
+							settings_cycle_mando(
+								(rising &
+								 VPAD_BUTTON_RIGHT)
+									? 1
+									: -1);
 					}
 				}
 				else if(rising & VPAD_BUTTON_X)
@@ -4889,8 +5028,8 @@ int main(int argc, char **argv)
 				if(g_qual_menu_open)
 				{
 					int px, py, pw, ph, mrow;
-					quality_menu_geom(854, 480, &px, &py,
-							  &pw, &ph, &mrow);
+					preset_menu_geom(854, 480, VIDEO_PRESET_COUNT,
+							  &px, &py, &pw, &ph, &mrow);
 					// u=8 en el DRC (scale 1): filas a
 					// py + u*4 (debajo del titulo).
 					int rows_y = py + 32;
@@ -4914,6 +5053,32 @@ int main(int argc, char **argv)
 					}
 					g_set_drag_moved = true; // el toque lo consumio
 				}
+				else if(g_mando_menu_open)
+				{
+					int px, py, pw, ph, mrow;
+					preset_menu_geom(854, 480, MANDO_MODES,
+							  &px, &py, &pw, &ph,
+							  &mrow);
+					// u=8 en el DRC: filas a py + u*4.
+					int rows_y = py + 32;
+					int row = ((int)tp.y - rows_y) / mrow;
+					if((int)tp.x >= px &&
+					   (int)tp.x < px + pw &&
+					   (int)tp.y >= rows_y &&
+					   row >= 0 && row < MANDO_MODES &&
+					   (int)tp.y < rows_y + mrow *
+							   MANDO_MODES)
+					{
+						g_mando_menu_sel = row;
+						mando_menu_apply();
+					}
+					else
+					{
+						g_mando_menu_open = false;
+						logprintf("Modo: menu cerrado");
+					}
+					g_set_drag_moved = true; // el toque lo consumio
+				}
 				else
 				{
 					g_set_drag_y = (int)tp.y;
@@ -4927,7 +5092,7 @@ int main(int argc, char **argv)
 			else if(touched && g_set_touch_prev)
 			{
 				// Mantenido: umbral de arrastre y seguimiento del dedo.
-				if(!g_qual_menu_open)
+				if(!g_qual_menu_open && !g_mando_menu_open)
 				{
 					int dy = (int)tp.y - g_set_drag_y;
 					if(!g_set_drag_moved &&
@@ -4943,7 +5108,7 @@ int main(int argc, char **argv)
 			else if(!touched && g_set_touch_prev)
 			{
 				// Soltar: inercia del arrastre o activar la fila.
-				if(!g_qual_menu_open)
+				if(!g_qual_menu_open && !g_mando_menu_open)
 					settings_touch_release(g_set_drag_x, g_set_drag_ly);
 			}
 			g_set_touch_prev = touched;
@@ -5645,7 +5810,8 @@ int main(int argc, char **argv)
 			// los pases WHBGfx: los passes solo dibujan el par ya
 			// subido (gui-40 subia dentro de cada pass => 2 copias
 			// por vuelta, ~15.6 ms y bucle a 21 Hz).
-			if(g_session_active && !g_mando_session)
+			if(g_session_active &&
+			   !(g_av_disabled & CHIAKI_VIDEO_DISABLED))
 				wiiu_video_upload();
 
 			WHBGfxBeginRender();
@@ -5654,10 +5820,10 @@ int main(int argc, char **argv)
 			WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
 			if(g_session_active)
 			{
-				// Modo mando (gui-102): la TV queda negra (clear
-				// #121212, sin tarjeta): el jugador mira su
-				// consola.
-				if(!g_mando_session)
+				// Modo sin vídeo (gui-102/103): la TV queda
+				// negra (clear #121212, sin tarjeta): el jugador
+				// mira su consola.
+				if(!(g_av_disabled & CHIAKI_VIDEO_DISABLED))
 				{
 					wiiu_video_render(1920, 1080);
 					// Sin muestra de video aun: tarjeta
@@ -5680,12 +5846,18 @@ int main(int argc, char **argv)
 			WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
 			if(g_session_active)
 			{
-				// Modo mando (gui-102): tarjeta de estado; parar,
-				// micro y touchpad igual que siempre.
-				if(g_mando_session)
+				// Modo sin vídeo (gui-102/103): tarjeta de
+				// estado; parar, micro y touchpad igual que
+				// siempre. El subtitulo lo fija el preset.
+				if(g_av_disabled & CHIAKI_VIDEO_DISABLED)
 				{
 					if(g_session_connected)
-						draw_mando_card(854, 480);
+						draw_mando_card(
+							854, 480,
+							(g_av_disabled &
+							 CHIAKI_AUDIO_DISABLED)
+								? "El video esta en tu consola"
+								: "Sin video: solo audio y mando");
 					else
 						draw_connecting(854, 480);
 				}

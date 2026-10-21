@@ -10,7 +10,7 @@
 //   log_enabled=<0|1>                        log.txt en la SD (default 0)
 //   vibration_enabled=<0|1>                  vibracion del GamePad (default 1)
 
-//   mando_mode=<0|1>                         modo mando: sin stream (default 0)
+//   mando_mode=<0|1|2>                       modo de sesion: 0 normal, 1 solo mando, 2 sin video (default 0)
 //   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>
 //
 // Una linea "console=" por consola guardada. El modulo solo serializa/
@@ -74,12 +74,12 @@ struct Config
 	// 0 = desactivada (motor parado al instante). Se alterna en
 	// Ajustes (fila Vibracion) y se persiste en config.ini.
 	int vibration_enabled;
-	// Modo mando (gui-102): 1 = la sesion se abre SIN stream (la
-	// consola no manda audio ni video) y el GamePad funciona como
-	// mando puro de la PS4: táctil, micrófono y vibración siguen.
-	// 0 = normal (default). Se alterna en Ajustes (fila Modo
-	// mando), persiste en config.ini y aplica en la próxima
-	// sesión.
+	// Modo de sesión (gui-102/103): 1 = sin audio ni vídeo (mando
+	// puro: la consola no manda stream y el GamePad es solo
+	// mando); 2 = sin vídeo (solo audio + mando); 0 = normal
+	// (default). Táctil, micrófono y vibración siguen en todos.
+	// Se elige en Ajustes (fila Modo), persiste en config.ini y
+	// aplica en la próxima sesión.
 	int mando_mode;
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
