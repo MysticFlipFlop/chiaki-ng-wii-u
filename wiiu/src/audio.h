@@ -30,7 +30,9 @@ void audio_session_start(void);
 void audio_session_stop(void);
 
 // Llamar cada frame del main loop con sesion activa: rellena el ring
-// por detras del playhead del DSP.
+// por detras del playhead del DSP y, si el staging acumulo backlog
+// tras un corte (>150 ms), recorta lo mas antiguo para volver a la
+// latencia normal (gui-101).
 void audio_update(void);
 
 // Sink de chiaki (hilo de sesion): PCM ya decodificado (s16le estereo

@@ -52,6 +52,19 @@
 // Hueco minimo entre playhead y zona de relleno (~42 ms): el relleno
 // corre a ~60 Hz y unarafaga lenta no debe quedar al alcance del DSP.
 #define FILL_GUARD_FRAMES 2048u
+//
+// Resync de audio (gui-101): tras un corte (bache de red) el backlog
+// opus entra al staging de golpe y, al reproducirse en orden, deja el
+// audio atrasado el resto de la sesion (el video si se recupera: el
+// frame processor descarta frames y muestra "ahora"). Si la
+// profundidad del staging pasa de STAGE_RESYNC_FRAMES se descartan
+// las muestras mas antiguas hasta STAGE_TARGET_FRAMES, con fundido de
+// entrada de RESYNC_FADE_FRAMES en la junta para no chasquear. El
+// jitter normal de opus queda muy por debajo del umbral: en sesiones
+// sanas no actua.
+#define STAGE_TARGET_FRAMES 2400u  // 50 ms tras recortar
+#define STAGE_RESYNC_FRAMES 7200u  // 150 ms: umbral de recorte
+#define RESYNC_FADE_FRAMES 480u    // 10 ms de fundido tras el corte
 // 48000 frames/s = 48 frames por ms, para el playhead por reloj.
 
 // Tono de prueba (fase 3b): 480 Hz durante los primeros 3 s de sesión.
@@ -115,6 +128,11 @@ static uint32_t g_fill = 0;  // frames: siguiente posicion a rellenar
 static uint32_t g_underruns = 0;
 static uint32_t g_underruns_logged = 0;
 static uint64_t g_underrun_log_ticks = 0;
+// Resync (gui-101): frames descartados del staging (para el log) y
+// fundido pendiente tras el ultimo recorte.
+static uint32_t g_resync_dropped = 0;
+static uint32_t g_resync_logged = 0;
+static uint32_t g_fade_left = 0;
 // Playhead: lo escribe el callback de frame de AX con el offset real
 // del DSP (muestras por canal = frames). Mientras no demuestre que se
 // mueve, se estima por reloj (48 frames/ms exactos).
@@ -331,6 +349,9 @@ void audio_session_start(void)
 	g_underruns = 0;
 	g_underruns_logged = 0;
 	g_underrun_log_ticks = OSGetTime();
+	g_resync_dropped = 0;
+	g_resync_logged = 0;
+	g_fade_left = 0;
 	g_dsp_play_frames = 0;
 	AXSetVoiceCurrentOffset(g_voice[0], 0);
 	AXSetVoiceCurrentOffset(g_voice[1], 0);
@@ -480,8 +501,22 @@ static void stage_to_ring(uint32_t off, uint32_t frames)
 		int16_t *rr = (int16_t *)g_ax_ring + AX_RING_FRAMES + o;
 		for(uint32_t i = 0; i < chunk; i++)
 		{
-			l[i] = src[i * 2];
-			rr[i] = src[i * 2 + 1];
+			int32_t sl = src[i * 2];
+			int32_t sr = src[i * 2 + 1];
+			if(g_fade_left)
+			{
+				// Fundido de entrada tras un recorte de
+				// resync: rampa lineal 0 -> 1.
+				int32_t ramp =
+					((int32_t)(RESYNC_FADE_FRAMES -
+						    g_fade_left) * 32768) /
+					(int32_t)RESYNC_FADE_FRAMES;
+				sl = (sl * ramp) >> 15;
+				sr = (sr * ramp) >> 15;
+				g_fade_left--;
+			}
+			l[i] = (int16_t)sl;
+			rr[i] = (int16_t)sr;
 		}
 		o = (o + chunk) % AX_RING_FRAMES;
 		r = (r + chunk * 4) % STAGE_BYTES;
@@ -524,6 +559,22 @@ void audio_update(void)
 		play = (uint32_t)((elapsed_ms * 48u) % AX_RING_FRAMES);
 	}
 
+	// Resync de backlog (gui-101): si tras un corte llego de golpe
+	// mas de STAGE_RESYNC_FRAMES al staging, descartar lo mas
+	// antiguo hasta el objetivo y armar el fundido de entrada.
+	{
+		size_t sf = (g_stage_w - g_stage_r) / 4;
+		if(sf > STAGE_RESYNC_FRAMES)
+		{
+			size_t drop = sf - STAGE_TARGET_FRAMES;
+			g_stage_r += drop * 4;
+			g_resync_dropped += (uint32_t)drop;
+			g_fade_left = RESYNC_FADE_FRAMES;
+			audio_log("Audio: resync backlog %u ms -> %u ms",
+				  (unsigned int)(drop / 48),
+				  (unsigned int)(STAGE_TARGET_FRAMES / 48));
+		}
+	}
 	// Relleno por detras del playhead, dejando el hueco de seguridad.
 	uint32_t need = (play + AX_RING_FRAMES - FILL_GUARD_FRAMES -
 			 g_fill) % AX_RING_FRAMES;
@@ -569,13 +620,15 @@ void audio_update(void)
 		uint32_t peak = g_peak_src;
 		g_peak_src = 0;
 		audio_log(
-			"Audio: play=%u dsp=%u running=%d fill=%u recv=%u underruns=+%u peak=%u",
+			"Audio: play=%u dsp=%u running=%d fill=%u recv=%u underruns=+%u resync=+%u peak=%u",
 			(unsigned int)play, (unsigned int)dsp_off,
 			(int)AXIsVoiceRunning(g_voice[0]),
 			(unsigned int)g_fill, (unsigned int)g_stage_w,
 			(unsigned int)(g_underruns - g_underruns_logged),
+			(unsigned int)(g_resync_dropped - g_resync_logged),
 			(unsigned int)peak);
 		g_underruns_logged = g_underruns;
+		g_resync_logged = g_resync_dropped;
 	}
 	OSUnlockMutex(&g_lock);
 }
