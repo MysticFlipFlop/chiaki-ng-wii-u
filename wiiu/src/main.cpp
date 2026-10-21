@@ -35,19 +35,29 @@
  */
 
 #include <whb/proc.h>
+#include <proc_ui/procui.h> // ProcUIInForeground (gui-95: pausa de
+                              // render con el overlay de Home)
 #include <whb/log.h>
 #include <whb/log_cafe.h>
 #include <whb/log_udp.h>
 #include <whb/crash.h>
 #include <whb/gfx.h>
 #include <gx2/swap.h> // GX2SetSwapInterval (opcion VSync de Ajustes)
+#include <gx2/event.h> // GX2GetSwapStatus (gui-96: telemetria de swap)
+#include <gx2/context.h> // GX2SetContextState (gui-97: re-enlace)
+#include <gx2/surface.h> // GX2SetColorBuffer/Depth (gui-97)
+#include <gx2/state.h>   // GX2Flush (gui-97)
+#include <gx2/mem.h>     // GX2Invalidate (gui-98: hash)
 #include <vpad/input.h>
 #include <nsysnet/_socket.h>
 #include <coreinit/time.h>
 #include <coreinit/filesystem.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/memfrmheap.h> // gui-96: heaps FG/MEM1 en log
 #include <coreinit/mutex.h>
 #include <coreinit/thread.h>
+#include <math.h>
+#include <string.h>
 #include <sndcore2/core.h>
 #include <mic/mic.h> // mic.rpl: micrófono interno del GamePad (gui-67)
 #include <nn/swkbd.h>
@@ -126,6 +136,8 @@ enum {
 	SET_ROW_QUALITY,
 	SET_ROW_VSYNC,
 	SET_ROW_LOG,
+	SET_ROW_VIBRATION,
+	SET_ROW_MANDO,
 	SET_ROW_DELETE,
 	SET_ROWS,
 };
@@ -161,6 +173,13 @@ static RegistState g_regist_state = RegistState::Idle;
 static ChiakiSession g_session;
 static bool g_session_active = false;
 static volatile bool g_session_quit_received = false;
+// Modo mando (gui-102): sesion viva pero sin stream (la consola
+// no manda audio ni video y aqui no se dibuja ni se reproduce
+// nada). Mando, táctil, micrófono y vibración siguen igual.
+static bool g_mando_session = false;
+// Handshake terminado (CHIAKI_EVENT_CONNECTED): en modo mando
+// cambia la tarjeta de "Conectando" a la de estado.
+static bool g_session_connected = false;
 // IP del destino de la sesion en curso (overlay "Conectando...") y
 // resultado de la ultima sesion (linea en el pie del menu).
 static char g_session_ip[48] = { 0 };
@@ -1465,6 +1484,73 @@ static bool video_sample_cb(uint8_t *buf, size_t buf_size, int32_t frames_lost,
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// gui-93: vibracion del GamePad (CHIAKI_EVENT_RUMBLE -> VPADControlMotor)
+// ---------------------------------------------------------------------------
+// El hilo de eventos solo deja constancia del estado (izq/dcha 0..255) y de
+// su instante; el motor lo mueve el bucle principal con wiiu_rumble_frame:
+// renueva una ventana de bits (VPADControlMotor reproduce bits a 120 Hz con
+// hasta 1 s en cola: 48 bits = 400 ms por emision, re-emision cada 150 ms,
+// vale con que la semantica sea "reemplaza" o "acumula") y lo para si el
+// estado se apaga, la sesion acaba o pasa el timeout de seguridad. Los
+// juegos deberian mandar 0,0 al terminar el efecto; si ese paquete se
+// perdiera, el timeout evita el motor zumbando sin control.
+#define RUMBLE_TIMEOUT_MS 3000
+#define RUMBLE_WINDOW_BITS 48
+#define RUMBLE_REFRESH_MS 150
+
+static uint8_t g_rumble_l = 0, g_rumble_r = 0;
+static uint64_t g_rumble_t0 = 0;
+static bool g_rumble_on = false;
+static uint64_t g_rumble_issue_t = 0;
+
+// Parada inmediata y silenciosa (casilla de Ajustes y salida al menu).
+static void wiiu_rumble_halt(void)
+{
+	g_rumble_l = g_rumble_r = 0;
+	g_rumble_t0 = 0;
+	g_rumble_on = false;
+	VPADStopMotor(VPAD_CHAN_0);
+}
+
+// Un paso del driver: una llamada por frame del bucle principal.
+static void wiiu_rumble_frame(void)
+{
+	uint64_t now = OSGetTime();
+	bool want = false;
+	if(g_session_active && g_config.vibration_enabled && g_rumble_t0 &&
+	   now - g_rumble_t0 < OSMillisecondsToTicks(RUMBLE_TIMEOUT_MS))
+	{
+		uint8_t l = g_rumble_l;
+		uint8_t r = g_rumble_r;
+		want = (l > 0) || (r > 0);
+	}
+	if(want)
+	{
+		if(!g_rumble_on)
+		{
+			g_rumble_on = true;
+			logprintf("Vibración: activa (izq=%u dcha=%u)",
+				  (unsigned)g_rumble_l, (unsigned)g_rumble_r);
+		}
+		if(now - g_rumble_issue_t >=
+		   OSMillisecondsToTicks(RUMBLE_REFRESH_MS))
+		{
+			uint8_t pat[15] = { 0 };
+			memset(pat, 0xff, RUMBLE_WINDOW_BITS / 8);
+			VPADControlMotor(VPAD_CHAN_0, pat, RUMBLE_WINDOW_BITS);
+			g_rumble_issue_t = now;
+		}
+	}
+	else if(g_rumble_on)
+	{
+		g_rumble_l = g_rumble_r = 0;
+		g_rumble_on = false;
+		VPADStopMotor(VPAD_CHAN_0);
+		logprintf("Vibración: parada");
+	}
+}
+
 static void session_event_cb(ChiakiEvent *event, void *user)
 {
 	(void)user;
@@ -1472,6 +1558,16 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 	{
 	case CHIAKI_EVENT_CONNECTED:
 		logprintf("Sesion: conectada (session request OK)");
+		g_session_connected = true;
+		if(g_mando_session)
+		{
+			// Modo mando (gui-102): sin frames de video, el
+			// surface del touchpad se muestra aqui (misma
+			// ventana de 2 s que con el primer frame).
+			g_tp_stream_seen = true;
+			g_tp_show_until =
+				OSGetTime() + OSMillisecondsToTicks(2000);
+		}
 		break;
 	case CHIAKI_EVENT_NICKNAME_RECEIVED:
 		logprintf("Sesion: PS4 '%s'", event->server_nickname);
@@ -1511,6 +1607,13 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 				 "Última sesión fallida: %s",
 				 chiaki_quit_reason_string(event->quit.reason));
 		g_session_quit_received = true;
+		break;
+	case CHIAKI_EVENT_RUMBLE:
+		// gui-93: estado de vibracion (izq/dcha); el motor lo
+		// mueve el bucle principal (wiiu_rumble_frame).
+		g_rumble_l = event->rumble.left;
+		g_rumble_r = event->rumble.right;
+		g_rumble_t0 = OSGetTime();
 		break;
 	default:
 		break;
@@ -1895,13 +1998,22 @@ static bool start_session()
 	info.video_profile_auto_downgrade = true;
 	info.enable_keyboard = false;
 	info.enable_dualsense = false;
-	info.audio_video_disabled = CHIAKI_NONE_DISABLED;
+	// Modo mando (gui-102): sin stream — la consola no manda ni
+	// audio ni video (el protocolo lo admite) y el GamePad queda
+	// como mando puro.
+	g_mando_session = (g_config.mando_mode != 0);
+	info.audio_video_disabled = g_mando_session
+				       ? CHIAKI_AUDIO_VIDEO_DISABLED
+				       : CHIAKI_NONE_DISABLED;
 	info.auto_regist = false;
 	info.packet_loss_max = 0.05; // tope de perdida reportada al servidor
 	info.enable_idr_on_fec_failure = true;
 	memcpy(info.psn_account_id, g_psn_account_id, sizeof(info.psn_account_id));
 
 	snprintf(g_session_ip, sizeof(g_session_ip), "%s", host);
+	if(g_mando_session)
+		logprintf("Sesion: modo mando — sin stream"
+			  " (audio/video desactivados en protocolo)");
 	logprintf("Sesion: conectando con %s (req_port %u informativo, chiaki usa 9295)",
 		     host, (unsigned int)req_port);
 
@@ -1933,7 +2045,8 @@ static bool start_session()
 	ChiakiAudioSink audio_sink = {};
 	chiaki_opus_decoder_get_sink(&g_opus_decoder, &audio_sink);
 	chiaki_session_set_audio_sink(&g_session, &audio_sink);
-	audio_session_start();
+	if(!g_mando_session) // sin downlink en modo mando (gui-102)
+		audio_session_start();
 
 	err = chiaki_session_start(&g_session);
 	if(err != CHIAKI_ERR_SUCCESS)
@@ -1946,6 +2059,7 @@ static bool start_session()
 	g_session_active = true;
 	g_session_quit_received = false;
 	g_session_login_pin_requested = false;
+	g_session_connected = false; // espera CHIAKI_EVENT_CONNECTED
 	g_video_frames = 0;
 	g_tp_stream_seen = false; // el surface se mostrara con el1er frame
 	g_tp_show_until = 0;      // oculto hasta entonces
@@ -1988,7 +2102,11 @@ static bool start_session()
 	return true;
 }
 
-static void stop_session(bool shutdown = false)
+// skip_gpu_wait: sin GX2DrawDone al finalizar. HOME con stream
+// puede correr con el contexto gx2 en background y ahi DrawDone
+// puede DSI (ver wiiu_video_reset); al cerrar no hace falta
+// esperar: el GPU termina sus draws sobre memoria mapeada.
+static void stop_session(bool skip_gpu_wait = false)
 {
 	if(!g_session_active)
 		return;
@@ -2004,11 +2122,14 @@ static void stop_session(bool shutdown = false)
 	chiaki_opus_decoder_fini(&g_opus_decoder);
 	audio_session_stop();
 	// Libera decoder h264 (~40 MB) y buffers; el hilo de video ya esta
-	// unido, asi que nadie llama a wiiu_video_sample ahora. En shutdown
-	// (HOME con stream) no se espera al GPU: ver wiiu_video_reset.
-	wiiu_video_reset(!shutdown);
+	// unido, asi que nadie llama a wiiu_video_sample ahora. Con
+	// skip_gpu_wait (HOME con stream) no se espera al GPU: ver
+	// wiiu_video_reset.
+	wiiu_video_reset(!skip_gpu_wait);
 	g_session_active = false;
 	g_session_login_pin_requested = false;
+	g_session_connected = false;
+	g_mando_session = false;
 	logprintf("Sesion finalizada");
 }
 
@@ -2455,7 +2576,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-92"
+#define APP_BUILD_TAG "gui-102"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2510,6 +2631,37 @@ static void draw_connecting(int w, int h)
 			 scale, 'B', GUI_RGBA(0x54, 0x54, 0x54, 0xff),
 			 GUI_RGBA(0xff, 0xff, 0xff, 0xde));
 	gui_text(bx + chip_d + chip_gap, cy + (float)(u * 3), hint,
+		 GUI_RGBA(0xff, 0xff, 0xff, 0x8a), scale);
+
+	gui_flush();
+}
+
+// Tarjeta del modo mando (gui-102): solo en la GamePad (la TV
+// queda negra: el jugador mira su consola). Avisa de que la
+// sesion esta viva y que este GamePad es el mando; los iconos
+// de parar y microfono y el touchpad siguen encima, igual que
+// en cualquier sesion.
+static void draw_mando_card(int w, int h)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+
+	const char *title = "Modo mando activo";
+	const char *sub = "El video esta en tu consola";
+
+	gui_begin(w, h);
+
+	float tw = gui_text_width(title, scale);
+	float sw = gui_text_width(sub, scale);
+	float cw = (tw > sw ? tw : sw) + (float)(u * 3);
+	float ch = (float)(u * 6);
+	float cx = ((float)w - cw) / 2.f;
+	float cy = ((float)h - ch) / 2.f;
+
+	gui_rect(cx, cy, cw, ch, GUI_RGBA(0x1e, 0x1e, 0x1e, 0xff));
+	gui_text(cx + (cw - tw) / 2.f, cy + (float)u, title,
+		 GUI_RGBA(0xff, 0xff, 0xff, 0xde), scale);
+	gui_text(cx + (cw - sw) / 2.f, cy + (float)(u * 3), sub,
 		 GUI_RGBA(0xff, 0xff, 0xff, 0x8a), scale);
 
 	gui_flush();
@@ -2963,14 +3115,236 @@ static void settings_row_geom(int w, int h, int *list_y, int *row_h)
 {
 	int scale = (w >= 1280) ? 2 : 1;
 	int u = 8 * scale;
-	*list_y = (u * 3 + u / 2) + u * 6; // barra + titulo
+	// gui-94: la lista sube u - 7 filas fijas sin invadir el
+	// hint en la DRC (antes 76: filas hasta 468 con el hint
+	// en 464; ahora 68: filas 68..460). En la TV el scroll
+	// se encarga igualmente.
+	*list_y = (u * 3 + u / 2) + u * 5; // barra + titulo
 	*row_h = u * 7;
-	// Seis filas (gui-82: + Log.txt) tienen que caber por encima del
-	// hint: en la TV (720) u*7x6 se salia de la pantalla, ahi se
-	// compactan (la DRC, con u*7, queda intacta).
-	int fit = (h - *list_y - u * 2) / SET_ROWS;
-	if(fit < *row_h)
-		*row_h = fit;
+	// gui-93: filas de ALTURA FIJA (u*7). Se retiro el encogido
+	// para que quepan: lo que no cabe en la pantalla lo mueve el
+	// scroll animado (settings_scroll_step) - hoy la DRC casi lo
+	// encaja entero y en la TV, con las filas a doble escala, la
+	// lista se desplaza de verdad.
+	(void)h;
+}
+
+// Geometria de la X de cierre de Ajustes (gui-94): caja u*4 en la
+// esquina superior derecha, a la altura del titulo. Compartida por el
+// dibujo (TV y DRC) y el toque del DRC (854x480).
+static void settings_close_geom(int w, int h, int *x, int *y, int *d)
+{
+	(void)h;
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	int m = w / 40;
+	*d = u * 4;
+	*x = w - m - *d;
+	// Centro del titulo (bar_h + u*2 + media fuente = bar_h + 3u)
+	// menos media caja (2u): y = bar_h + u.
+	*y = (u * 3 + u / 2) + u;
+}
+
+
+// ---------------------------------------------------------------------------
+// gui-93: scroll animado de Ajustes (Material, filas fijas).
+// ---------------------------------------------------------------------------
+// g_set_scroll va en FRACCION del rango desplazable (0..1, con goteo
+// elastico en los toques) para que DRC (854x480) y TV (720p, filas a doble
+// escala) compartan un unico estado: cada superficie lo multiplica por su
+// propio rango en pixeles. La seleccion por D-pad lanza un muelle
+// criticamente amortiguado (~250 ms, sin rebasar); el arrastre tactil manda
+// directo y al soltar sigue la inercia con friccion; en los extremos, el
+// rebote elastico.
+#define SET_SCROLL_RB 0.06f // goteo mas alla de los toques (fraccion)
+#define SET_DRAG_PX 8       // umbral en px para pasar de toque a arrastre
+
+static float g_set_scroll = 0.f;      // posicion (fraccion 0..1)
+static float g_set_scroll_vel = 0.f;  // velocidad (fraccion/s)
+static float g_set_scroll_tgt = 0.f;  // objetivo del muelle (D-pad)
+static bool g_set_scroll_on = false;  // true = modo muelle hacia tgt
+static uint64_t g_set_scroll_t = 0;   // ultimo paso de fisica
+static bool g_set_dragging = false;   // arrastre tactil en curso
+static int g_set_drag_y = 0;          // y del inicio del toque
+static int g_set_drag_x = 0;          // x del inicio del toque
+static float g_set_drag_f0 = 0.f;     // scroll en el inicio del toque
+static int g_set_drag_ly = 0;         // ultima y muestreada
+static uint64_t g_set_drag_lt = 0;    // instante de la ultima muestra
+static bool g_set_drag_moved = false; // supero el umbral de arrastre
+static float g_set_bar_a = 0.f;       // alfa de la barra (0..1)
+static uint64_t g_set_bar_t = 0;      // ultimo movimiento (fin de la barra)
+
+// Rango desplazable en pixeles de una superficie (0 = la lista cabe).
+static float settings_max_px(int w, int h)
+{
+	int list_y, row_h;
+	settings_row_geom(w, h, &list_y, &row_h);
+	int u = 8 * ((w >= 1280) ? 2 : 1);
+	float vp = (float)(h - list_y - u * 2);
+	float max_px = (float)(SET_ROWS * row_h) - vp;
+	return (max_px > 0.f) ? max_px : 0.f;
+}
+
+// Rango de scroll (fraccion) en el que la fila "row" queda COMPLETA en
+// pantalla: interseccion de lo que exige cada superficie (la TV, con el
+// viewport mas justo, suele mandar).
+static void settings_sel_range(int row, float *lo, float *hi)
+{
+	*lo = 0.f;
+	*hi = 1.f;
+	const int dims[2][2] = { { 854, 480 }, { 1280, 720 } };
+	for(int s = 0; s < 2; s++)
+	{
+		int w = dims[s][0], h = dims[s][1];
+		int list_y, row_h;
+		settings_row_geom(w, h, &list_y, &row_h);
+		int u = 8 * ((w >= 1280) ? 2 : 1);
+		float vp = (float)(h - list_y - u * 2);
+		float max_px = (float)(SET_ROWS * row_h) - vp;
+		if(max_px <= 0.f)
+			continue; // la lista cabe entera: sin restriccion
+		float f_lo = ((float)((row + 1) * row_h) - vp) / max_px;
+		float f_hi = ((float)(row * row_h)) / max_px;
+		if(f_lo < 0.f)
+			f_lo = 0.f;
+		if(f_hi > 1.f)
+			f_hi = 1.f;
+		if(f_lo > *lo)
+			*lo = f_lo;
+		if(f_hi < *hi)
+			*hi = f_hi;
+	}
+	if(*lo > *hi)
+		*hi = *lo;
+}
+
+// Tras mover la seleccion (D-pad o toque): si la fila no queda entera,
+// lanza el muelle hacia el extremo que la recupera.
+static void settings_ensure_sel_visible(void)
+{
+	float lo, hi;
+	settings_sel_range(g_set_sel, &lo, &hi);
+	float cur = g_set_scroll_on ? g_set_scroll_tgt : g_set_scroll;
+	if(cur < lo)
+	{
+		g_set_scroll_tgt = lo;
+		g_set_scroll_on = true;
+	}
+	else if(cur > hi)
+	{
+		g_set_scroll_tgt = hi;
+		g_set_scroll_on = true;
+	}
+}
+
+// Movimiento de seleccion con wrap + asegurar visibilidad.
+static void settings_sel_move(int dir)
+{
+	g_set_sel = (g_set_sel + dir + SET_ROWS) % SET_ROWS;
+	settings_ensure_sel_visible();
+}
+
+// Reinicia el scroll al abrir Ajustes.
+static void settings_scroll_reset(void)
+{
+	g_set_scroll = 0.f;
+	g_set_scroll_vel = 0.f;
+	g_set_scroll_tgt = 0.f;
+	g_set_scroll_on = false;
+	g_set_dragging = false;
+	g_set_drag_moved = false;
+}
+
+// Paso de fisica por frame (lo llama draw_menu; la segunda superficie
+// del frame - TV y DRC - entra con dt~0 y no hace nada).
+static void settings_scroll_step(int w, int h)
+{
+	uint64_t now = OSGetTime();
+	float dt = (float)((double)(now - g_set_scroll_t) /
+			   (double)OSMillisecondsToTicks(1)) * 0.001f;
+	g_set_scroll_t = now;
+	if(dt <= 0.f)
+		return;
+	if(dt > 0.05f)
+		dt = 0.05f;
+
+	float max_px = settings_max_px(w, h);
+	if(max_px <= 0.f)
+	{
+		g_set_scroll = 0.f;
+		g_set_scroll_vel = 0.f;
+		g_set_scroll_on = false;
+	}
+	else if(!g_set_dragging)
+	{
+		if(g_set_scroll_on)
+		{
+			// Muelle criticamente amortiguado: a = w^2*(t-x)
+			// - 2*w*v (w=16 -> pleno en ~250 ms, sin rebasar).
+			float a = 256.f * (g_set_scroll_tgt - g_set_scroll) -
+				  32.f * g_set_scroll_vel;
+			g_set_scroll_vel += a * dt;
+			g_set_scroll += g_set_scroll_vel * dt;
+			if(fabsf(g_set_scroll_tgt - g_set_scroll) < 0.0015f &&
+			   fabsf(g_set_scroll_vel) < 0.05f)
+			{
+				g_set_scroll = g_set_scroll_tgt;
+				g_set_scroll_vel = 0.f;
+				g_set_scroll_on = false;
+			}
+		}
+		else
+		{
+			// Inercia del flick con friccion exponencial.
+			g_set_scroll += g_set_scroll_vel * dt;
+			g_set_scroll_vel *= expf(-5.f * dt);
+			if(fabsf(g_set_scroll_vel) < 0.03f)
+				g_set_scroll_vel = 0.f;
+			// Rebote elastico en los toques.
+			if(g_set_scroll < 0.f || g_set_scroll > 1.f)
+			{
+				float b = (g_set_scroll < 0.f) ? 0.f : 1.f;
+				float over = g_set_scroll - b;
+				if(over < -SET_SCROLL_RB)
+					over = -SET_SCROLL_RB;
+				if(over > SET_SCROLL_RB)
+					over = SET_SCROLL_RB;
+				g_set_scroll = b + over;
+				g_set_scroll_vel += (-200.f * over -
+						     24.f * g_set_scroll_vel) *
+					    dt;
+				if(fabsf(over) < 0.002f &&
+				   fabsf(g_set_scroll_vel) < 0.05f)
+				{
+					g_set_scroll = b;
+					g_set_scroll_vel = 0.f;
+				}
+			}
+		}
+	}
+
+	// Barra: encendida mientras se mueve, se desvanece a los 900 ms.
+	if(g_set_dragging || g_set_scroll_on ||
+	   fabsf(g_set_scroll_vel) > 0.03f)
+		g_set_bar_t = now;
+	float fade_t = (now - g_set_bar_t < OSMillisecondsToTicks(900))
+			       ? 1.f
+			       : 0.f;
+	float k = dt * 10.f;
+	if(k > 1.f)
+		k = 1.f;
+	g_set_bar_a += (fade_t - g_set_bar_a) * k;
+}
+
+// Multiplica el alfa de un color GUI_RGBA (fundido de borde de filas).
+static uint32_t c_mul_a(uint32_t c, float a)
+{
+	if(a >= 1.f)
+		return c;
+	uint32_t al = (uint32_t)((float)(c & 0xffu) * a);
+	if(al > 0xffu)
+		al = 0xffu;
+	return (c & 0xffffff00u) | al;
 }
 
 // Geometria del menu contextual de presets (gui-61): panel centrado
@@ -3051,6 +3425,31 @@ static void settings_toggle_log(void)
 		  g_config.log_enabled ? "activado" : "desactivado");
 }
 
+// Vibracion del GamePad (gui-93): activada por defecto; la casilla la
+// apaga y detiene el motor al instante. Persiste en config.ini.
+static void settings_toggle_vibration(void)
+{
+	g_config.vibration_enabled = g_config.vibration_enabled ? 0 : 1;
+	g_config_dirty = true;
+	if(!g_config.vibration_enabled)
+		wiiu_rumble_halt(); // silencioso: este toggle ya loguea
+	logprintf("Vibración: %s (persiste en config.ini)",
+		  g_config.vibration_enabled ? "activada" : "desactivada");
+}
+
+// Modo mando (gui-102): desactiva el stream de la sesion — la
+// consola no manda audio ni video y el GamePad queda como mando
+// puro (más táctil, micrófono y vibración). Aplica en la próxima
+// sesión.
+static void settings_toggle_mando(void)
+{
+	g_config.mando_mode = g_config.mando_mode ? 0 : 1;
+	g_config_dirty = true;
+	logprintf("Modo mando: %s (persiste en config.ini, aplica en"
+		  " la próxima sesión)",
+		  g_config.mando_mode ? "activado" : "desactivado");
+}
+
 // Accion de una fila de Ajustes (A o toque en el DRC).
 static void settings_activate(int row)
 {
@@ -3089,6 +3488,10 @@ static void settings_activate(int row)
 		settings_toggle_vsync();
 	else if(row == SET_ROW_LOG)
 		settings_toggle_log();
+	else if(row == SET_ROW_VIBRATION)
+		settings_toggle_vibration();
+	else if(row == SET_ROW_MANDO)
+		settings_toggle_mando();
 	else if(row == SET_ROW_DELETE)
 	{
 		// Ultima fila de Ajustes. Cierra Ajustes (el dialogo
@@ -3115,6 +3518,84 @@ static void settings_activate(int row)
 	}
 }
 
+// Cierra Ajustes con la transicion (gui-94): la usan B y la X tactil
+// de la esquina superior derecha.
+static void settings_close_anim(const char *how)
+{
+	g_set_anim = SetAnim::Closing;
+	g_set_anim_t0 = OSGetTime();
+	g_set_touch_prev = false;
+	logprintf("Ajustes: cerrados (%s)", how);
+}
+
+// Arrastre tactil sobre la lista: sigue al dedo con goteo elastico fuera
+// del rango y muestrea la velocidad para la inercia al soltar.
+static void settings_drag_to(int y)
+{
+	float mpx = settings_max_px(854, 480);
+	if(mpx < 1.f)
+		mpx = 1.f;
+	float raw = g_set_drag_f0 - (float)(y - g_set_drag_y) / mpx;
+	if(raw < 0.f)
+		raw = -SET_SCROLL_RB * tanhf(-raw / SET_SCROLL_RB);
+	else if(raw > 1.f)
+		raw = 1.f + SET_SCROLL_RB * tanhf((raw - 1.f) / SET_SCROLL_RB);
+	g_set_scroll = raw;
+	g_set_scroll_on = false;
+	uint64_t now = OSGetTime();
+	float dt = (float)((double)(now - g_set_drag_lt) /
+			   (double)OSMillisecondsToTicks(1)) * 0.001f;
+	if(dt > 0.004f)
+	{
+		float v = -(float)(y - g_set_drag_ly) / mpx / dt;
+		if(v > 5.f)
+			v = 5.f;
+		if(v < -5.f)
+			v = -5.f;
+		g_set_scroll_vel = v;
+		g_set_drag_ly = y;
+		g_set_drag_lt = now;
+	}
+}
+
+// Fin del toque: si hubo arrastre queda la inercia; si fue un toque
+// simple en una fila, la selecciona y activa (mismo flujo que A) con
+// el scroll aplicado.
+static void settings_touch_release(int x, int y)
+{
+	if(g_set_drag_moved)
+	{
+		g_set_dragging = false;
+		g_set_bar_t = OSGetTime();
+		if(settings_max_px(854, 480) <= 0.f)
+			g_set_scroll_vel = 0.f; // sin rango: nada que colear
+		return;
+	}
+	// X de cierre (gui-94): esquina superior derecha, a la
+	// altura del titulo; queda fuera de la lista, se comprueba
+	// antes que las filas.
+	int cx, cy, cd;
+	settings_close_geom(854, 480, &cx, &cy, &cd);
+	if(x >= cx && x < cx + cd && y >= cy && y < cy + cd)
+	{
+		settings_close_anim("X");
+		return;
+	}
+	int list_y, row_h;
+	settings_row_geom(854, 480, &list_y, &row_h);
+	int vp_h = 480 - list_y - 8 * 2;
+	if(y < list_y || y >= list_y + vp_h)
+		return;
+	float scroll_px = g_set_scroll * settings_max_px(854, 480);
+	int row = (int)floorf(((float)(y - list_y) + scroll_px) /
+			       (float)row_h);
+	if(row < 0 || row >= SET_ROWS)
+		return;
+	g_set_sel = row;
+	settings_ensure_sel_visible();
+	settings_activate(row);
+}
+
 // Avance de la transicion de Ajustes0..1 (1 si no hay animacion).
 static float set_anim_progress(void)
 {
@@ -3135,6 +3616,7 @@ static void settings_open_anim(const char *how)
 	g_settings_open = true;
 	g_set_sel = 0;
 	g_set_touch_prev = false;
+	settings_scroll_reset();
 	g_set_anim = SetAnim::Opening;
 	g_set_anim_t0 = OSGetTime();
 	logprintf("%s: Ajustes abiertos (B cierra)", how);
@@ -3207,13 +3689,54 @@ static void draw_menu(int w, int h)
 	{
 		int list_y, row_h;
 		settings_row_geom(w, h, &list_y, &row_h);
+		// Fisica del scroll (dt real solo en la primera
+		// superficie del frame) y rango de la lista en px.
+		settings_scroll_step(w, h);
+		int vp_h = h - list_y - u * 2;
+		float max_px = settings_max_px(w, h);
+		float scroll_px = g_set_scroll * max_px;
+		float fade_px = (float)(u * 3);
 
 		gui_text((float)m, (float)(bar_h + u * 2), "Ajustes",
 			 c_text, scale * 2);
+		// X de cierre (gui-94/95): el × de la fuente (U+00D7, ya
+		// horneada en el atlas) centrado en la caja u*4 (32/64
+		// px); la caja entera sigue siendo la zona tactil.
+		int cx, cy, cd;
+		settings_close_geom(w, h, &cx, &cy, &cd);
+		float glyph = (float)(scale * 2) * 8.f; // gui_text a scale*2
+		gui_text((float)cx + ((float)cd - glyph) * 0.5f,
+			 (float)cy + ((float)cd - glyph) * 0.5f, "×",
+			 c_text2, scale * 2);
 
 		for(int i = 0; i < SET_ROWS; i++)
 		{
-			int y = list_y + i * row_h;
+			// Posicion con el scroll aplicado. El fundido de borde
+			// baja el alfa de la fila al entrar o salir del
+			// viewport (el gui no tiene scissor: la fila que se va
+			// se desvanece en vez de cortarse en seco) y la que
+			// esta entera fuera ni se dibuja.
+			float yf = (float)(list_y + i * row_h) - scroll_px;
+			float cut_t = (float)list_y - yf;
+			float cut_b = yf + (float)row_h -
+				      (float)(list_y + vp_h);
+			float c0 = fade_px * 0.3f;
+			float fa = 1.f;
+			if(cut_t > c0)
+			{
+				float a = (fade_px - cut_t) / (fade_px - c0);
+				if(a < fa)
+					fa = (a < 0.f) ? 0.f : a;
+			}
+			if(cut_b > c0)
+			{
+				float a = (fade_px - cut_b) / (fade_px - c0);
+				if(a < fa)
+					fa = (a < 0.f) ? 0.f : a;
+			}
+			if(fa <= 0.02f)
+				continue;
+			int y = (int)yf;
 			// Feedback de seleccion sin tocar la legibilidad:
 			// tinte fuerte + barra ancha + chevron a la derecha
 			// de la fila activa (el texto siempre blanco).
@@ -3222,9 +3745,10 @@ static void draw_menu(int w, int h)
 			{
 				gui_rect(0.f, (float)y, (float)w,
 					 (float)row_h,
-					 GUI_RGBA(0x00, 0xa7, 0xff, 0x59));
+					 c_mul_a(GUI_RGBA(0x00, 0xa7, 0xff, 0x59),
+						 fa));
 				gui_rect(0.f, (float)y, (float)(u / 2),
-					 (float)row_h, c_accent);
+					 (float)row_h, c_mul_a(c_accent, fa));
 			}
 
 			const char *label;
@@ -3239,7 +3763,7 @@ static void draw_menu(int w, int h)
 				   parse_psn_account_id(g_config.account_id_hex,
 						       id) &&
 				   chiaki_base64_encode(id, sizeof(id), b64,
-							 sizeof(b64)) ==
+							sizeof(b64)) ==
 					       CHIAKI_ERR_SUCCESS)
 				{
 					// En base64, el mismo formato en
@@ -3271,18 +3795,26 @@ static void draw_menu(int w, int h)
 			{
 				label = "Calidad de video";
 				snprintf(value, sizeof(value), "%s",
-					 video_preset_label(
-						 video_preset_cur()));
+					 video_preset_label(video_preset_cur()));
 			}
 			else if(i == SET_ROW_VSYNC)
 			{
 				label = "VSync";
-				value[0] = '\0'; // estado: checkbox, sin
-				                   // texto de valor
+				value[0] = '\0'; // estado: checkbox, sin texto
 			}
 			else if(i == SET_ROW_LOG)
 			{
 				label = "Log.txt";
+				value[0] = '\0'; // estado: checkbox, sin texto
+			}
+			else if(i == SET_ROW_VIBRATION)
+			{
+				label = "Vibración";
+				value[0] = '\0'; // estado: checkbox, sin texto
+			}
+			else if(i == SET_ROW_MANDO)
+			{
+				label = "Modo mando";
 				value[0] = '\0'; // estado: checkbox, sin texto
 			}
 			else
@@ -3301,8 +3833,7 @@ static void draw_menu(int w, int h)
 					const ConfigConsole *pc =
 						&g_config.consoles[psel];
 					snprintf(value, sizeof(value), "%s",
-						 pc->name[0] ? pc->name
-								      : "?");
+						 pc->name[0] ? pc->name : "?");
 				}
 				else
 				{
@@ -3313,47 +3844,75 @@ static void draw_menu(int w, int h)
 			}
 
 			int ty = y + (row_h - u) / 2;
-			gui_text((float)(m + u), (float)ty, label, c_text,
-				 scale);
+			gui_text((float)(m + u), (float)ty, label,
+				 c_mul_a(c_text, fa), scale);
 			// Valor a la derecha con hueco fijo para el
 			// chevron de la fila activa (sin salto de texto).
 			gui_text((float)(w - m - u * 2) -
-					 gui_text_width(value, scale),
-				 (float)ty, value, vc, scale);
-			// Checkbox de VSync (gui-60) y Log.txt (gui-82): caja
-			// Material a la derecha — rellena en accent con ✓ si
-			// activo, solo borde (c_text2) si no; el interior del
-			// borde respeta el tinte de la fila activa.
-			if(i == SET_ROW_VSYNC || i == SET_ROW_LOG)
+				 gui_text_width(value, scale),
+				 (float)ty, value, c_mul_a(vc, fa), scale);
+			// Checkbox Material (gui-60 VSync, gui-82 Log.txt,
+			// gui-93 Vibracion): rellena en accent con ✓ si activo,
+			// solo borde si no.
+			if(i == SET_ROW_VSYNC || i == SET_ROW_LOG ||
+			   i == SET_ROW_VIBRATION || i == SET_ROW_MANDO)
 			{
 				bool on = (i == SET_ROW_VSYNC)
 						  ? (g_config.vsync != 0)
-						  : (g_config.log_enabled != 0);
+						  : (i == SET_ROW_LOG)
+							    ? (g_config.log_enabled != 0)
+							    : (i == SET_ROW_VIBRATION)
+							    	? (g_config.vibration_enabled !=
+							    	   0)
+							    : (g_config.mando_mode != 0);
 				float cb = (float)(u * 3 / 2); // 12 / 24 px
 				float cbx = (float)(w - m - u * 2) - cb;
 				float cby = (float)y +
 					     ((float)row_h - cb) / 2.f;
 				if(on)
 				{
-					gui_rect(cbx, cby, cb, cb, c_accent);
+					gui_rect(cbx, cby, cb, cb,
+						 c_mul_a(c_accent, fa));
 					gui_text(cbx + (cb - (float)u) / 2.f,
 						 cby + (cb - (float)u) / 2.f,
-						 "✓", c_white, scale);
+						 "✓", c_mul_a(c_white, fa),
+						 scale);
 				}
 				else
 				{
 					float th = (float)scale;
-					gui_rect(cbx, cby, cb, th, vc);
+					uint32_t bc = c_mul_a(vc, fa);
+					gui_rect(cbx, cby, cb, th, bc);
 					gui_rect(cbx, cby + cb - th, cb, th,
-						 vc);
-					gui_rect(cbx, cby, th, cb, vc);
+						 bc);
+					gui_rect(cbx, cby, th, cb, bc);
 					gui_rect(cbx + cb - th, cby, th, cb,
-						 vc);
+						 bc);
 				}
 			}
 			if(is_sel)
 				gui_text((float)(w - m - u), (float)ty, ">",
-					 c_accent, scale);
+					 c_mul_a(c_accent, fa), scale);
+		}
+
+		// Barra de scroll fina (Material): aparece mientras la
+		// lista se mueve y se desvanece sola (solo con rango real).
+		if(max_px >= (float)row_h * 0.5f && g_set_bar_a > 0.01f)
+		{
+			float bw = (float)(scale * 2);
+			float bx = (float)w - (float)m * 0.5f - bw;
+			float thumb_h = (float)vp_h * (float)vp_h /
+					((float)vp_h + max_px);
+			float fr = g_set_scroll;
+			if(fr < 0.f)
+				fr = 0.f;
+			if(fr > 1.f)
+				fr = 1.f;
+			float by = (float)list_y +
+				   fr * ((float)vp_h - thumb_h);
+			uint32_t ba = (uint32_t)((float)0x61 * g_set_bar_a);
+			gui_rect(bx, by, bw, thumb_h,
+				 GUI_RGBA(0xff, 0xff, 0xff, ba));
 		}
 
 		// Sin hint de Ajustes con el menu de presets abierto: su
@@ -3742,6 +4301,120 @@ static void draw_menu_any(int w, int h)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// gui-96: diagnostico del ciclo ProcUI de whb (freeze tras Resume).
+// whb registra sus callbacks de gfx con prioridad 100 dentro de
+// WHBGfxInit; aqui registramos las nuestras ANTES (200) y DESPUES (50)
+// para ver en log.txt el orden real y el estado de los buffers y
+// heaps en cada transicion (los fallos internos de whb van a
+// OSReport/UDP y nunca llegaban al log de la SD).
+// ---------------------------------------------------------------------------
+static uint32_t gui96_rel_pre(void *)
+{
+	logprintf("ProcUI RELEASE(pre):  TV.img=%p DRC.img=%p FG_free=%u MEM1_free=%u",
+		  WHBGfxGetTVColourBuffer()->surface.image,
+		  WHBGfxGetDRCColourBuffer()->surface.image,
+		  (unsigned)MEMGetAllocatableSizeForFrmHeapEx(
+			  MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG), 4),
+		  (unsigned)MEMGetAllocatableSizeForFrmHeapEx(
+			  MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM1), 4));
+	return 0;
+}
+
+static uint32_t gui96_rel_post(void *)
+{
+	logprintf("ProcUI RELEASE(post): TV.img=%p DRC.img=%p",
+		  WHBGfxGetTVColourBuffer()->surface.image,
+		  WHBGfxGetDRCColourBuffer()->surface.image);
+	return 0;
+}
+
+// gui-99: frames de resincronizacion - VSync=1 tras cada acquire
+// hasta que el display confirme flips reales; luego el bucle
+// principal restaura la preferencia del usuario.
+static int g_pui_resync_frames = 0;
+
+static uint32_t gui96_acq_pre(void *)
+{
+	logprintf("ProcUI ACQUIRE(tras whb): TV.img=%p DRC.img=%p FG_free=%u"
+		  " MEM1_free=%u",
+		  WHBGfxGetTVColourBuffer()->surface.image,
+		  WHBGfxGetDRCColourBuffer()->surface.image,
+		  (unsigned)MEMGetAllocatableSizeForFrmHeapEx(
+			  MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG), 4),
+		  (unsigned)MEMGetAllocatableSizeForFrmHeapEx(
+			  MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM1), 4));
+	// gui-97: re-enlace del color/depth fresco en los context states
+	// de whb. Si la MEM1 se recreo en otra base al re-acquire, los
+	// estados guardan las direcciones ANTIGUAS: clear y draws
+	// aterrizarian en memoria vieja y la copia al scan buffer leyera
+	// el frame residual = pantalla congelada con flips perfectos.
+	// Misma secuencia que WHBGfxInit; protegido por si whb no llego
+	// a recrear los buffers (TV.img=(nil) en el log = otra causa).
+	GX2ColorBuffer *tv = WHBGfxGetTVColourBuffer();
+	GX2ContextState *tvs = WHBGfxGetTVContextState();
+	if(tv->surface.image)
+	{
+		GX2SetContextState(tvs);
+		GX2SetColorBuffer(tv, GX2_RENDER_TARGET_0);
+		GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+	}
+	GX2ColorBuffer *drc = WHBGfxGetDRCColourBuffer();
+	GX2ContextState *drcs = WHBGfxGetDRCContextState();
+	if(drc->surface.image)
+	{
+		GX2SetContextState(drcs);
+		GX2SetColorBuffer(drc, GX2_RENDER_TARGET_0);
+		GX2SetDepthBuffer(WHBGfxGetDRCDepthBuffer());
+	}
+	GX2Flush();
+	// gui-99: resincroniza el display tras el ciclo Release/Acquire.
+	// Con VSync=0 GX2 autoconfirma sus swaps (bucle abierto) y, con
+	// whb recreando los scan buffers dobles en el acquire, el
+	// hardware nunca llega a aplicar los flips = pantalla congelada
+	// con contadores sanos (validado en hw: con intervalo 1 la
+	// pantalla revive). Forzar intervalo 1 aqui hace que cada
+	// vuelta espere la confirmacion real del retrazador y el
+	// display se reenganche; a los N frames se restaura la
+	// preferencia del usuario.
+	GX2SetSwapInterval(1);
+	g_pui_resync_frames = 5;
+	logprintf("Resync display: VSync=1 por %d frames tras acquire",
+		  g_pui_resync_frames);
+	return 0;
+}
+
+static uint32_t gui96_acq_post(void *)
+{
+	logprintf("ProcUI ACQUIRE(antes de whb): TV.img=%p DRC.img=%p FG_free=%u",
+		  WHBGfxGetTVColourBuffer()->surface.image,
+		  WHBGfxGetDRCColourBuffer()->surface.image,
+		  (unsigned)MEMGetAllocatableSizeForFrmHeapEx(
+			  MEMGetBaseHeapHandle(MEM_BASE_HEAP_FG), 4));
+	return 0;
+}
+
+// gui-98: hash FNV-1a sobre el inicio de un buffer de color. Se
+// invalida la cache CPU antes (el GPU acaba de escribir; el muestreo
+// es al inicio de la vuelta, con GX2DrawDone del FinishRender
+// anterior ya cumplido = GPU en reposo, sin carril).
+static uint32_t gui98_bufhash(const void *p, uint32_t n)
+{
+	if(!p)
+		return 0;
+	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, (void *)p, n);
+	const uint8_t *b = (const uint8_t *)p;
+	uint32_t h = 2166136261u;
+	for(uint32_t i = 0; i < n; i++)
+		h = (h ^ b[i]) * 16777619u;
+	return h;
+}
+
+// Telemetria del bucle (gui-96): transiciones + contadores a 1 Hz.
+static bool g_pui_fg_prev = true;
+static uint64_t g_pui_log_t = 0;
+static uint32_t g_pui_loop_iters = 0;
+
 int main(int argc, char **argv)
 {
 	(void)argc;
@@ -3775,8 +4448,17 @@ int main(int argc, char **argv)
 
 	// Orden de init identico al build validado en consola (fase 2); la
 	// consola en pantalla y el log SD se insertan sin mover nada mas.
+	// gui-96: instrumentacion ProcUI (diagnostico del freeze).
+	ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, gui96_rel_pre,
+			       NULL, 200);
+	ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, gui96_acq_pre,
+			       NULL, 200);
 	logprintf("init: WHBGfxInit");
 	WHBGfxInit();
+	ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, gui96_rel_post,
+			       NULL, 50);
+	ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, gui96_acq_post,
+			       NULL, 50);
 	VPADInit();
 	logprintf("init: FSInit");
 	FSInit();
@@ -3803,7 +4485,7 @@ int main(int argc, char **argv)
 
 	// Tras log_file_init para que el marker llegue a la SD (antes solo
 	// iba a OSReport/UDP y no servia para confirmar el build desplegado).
-	logprintf("BUILD wiiu-2026-10-19 " APP_BUILD_TAG);
+	logprintf("BUILD wiiu-2026-10-20 " APP_BUILD_TAG);
 	wiiu_video_set_log(video_log_sink);
 
 	// Fase 4a: consolas registradas y cuenta guardadas en la SD. Se carga
@@ -3844,6 +4526,42 @@ int main(int argc, char **argv)
 	while(WHBProcIsRunning())
 	{
 		g_main_iters++;
+		// gui-96: transiciones de primer plano y telemetria de
+		// swap a 1 Hz (diagnostico del freeze tras Resume).
+		g_pui_loop_iters++;
+		{
+			bool fg = ProcUIInForeground();
+			if(fg != g_pui_fg_prev)
+			{
+				logprintf("ProcUI: %s",
+					  fg ? "BACKGROUND->FOREGROUND"
+					     : "FOREGROUND->BACKGROUND");
+				g_pui_fg_prev = fg;
+			}
+			uint64_t now = OSGetTime();
+			if(now - g_pui_log_t >= OSMillisecondsToTicks(1000))
+			{
+				g_pui_log_t = now;
+				uint32_t sc = 0, fc = 0;
+				OSTime lf = 0, lv = 0;
+				GX2GetSwapStatus(&sc, &fc, &lf, &lv);
+				const GX2ColorBuffer *tvb =
+					WHBGfxGetTVColourBuffer();
+				const GX2ColorBuffer *drcb =
+					WHBGfxGetDRCColourBuffer();
+				logprintf("ProcUI: fg=%s loop/s=%u swap=%u"
+					  " flip=%u vsync=%d tvh=%08x"
+					  " drch=%08x",
+					  fg ? "si" : "no",
+					  (unsigned)g_pui_loop_iters, sc, fc,
+					  g_config.vsync,
+					  gui98_bufhash(tvb->surface.image,
+							 262144),
+					  gui98_bufhash(drcb->surface.image,
+							 65536));
+				g_pui_loop_iters = 0;
+			}
+		}
 		// Vuelco del log a la SD en lotes (el handler solo encola):
 		// corriendo aqui tambien llegan los logs de arranque y de
 		// menu, y el hilo de red jamas toca FS.
@@ -3890,6 +4608,7 @@ int main(int argc, char **argv)
 				stop_session();
 		}
 
+		wiiu_rumble_frame(); // gui-93: driver de vibracion
 		VPADStatus status;
 		VPADReadError error;
 		// VPADRead es void; el resultado va en outError.
@@ -3914,12 +4633,33 @@ int main(int argc, char **argv)
 				// no desencadenar acciones fantasma al volver. Parar es
 				// el icono táctil; mientras dure la conexion (aun sin
 				// frames) manda la tarjeta: B cancela.
-				bool streaming = g_session_active && g_video_frames > 0;
+				// gui-102: en modo mando tambien es mando puro
+				// (sin frames) desde el principio.
+				bool streaming = g_session_active &&
+						 (g_video_frames > 0 ||
+						  g_mando_session);
 
 				if(streaming)
 					last_hold = status.hold;
 				else
 					log_vpad_changes(status, last_hold, last_touch);
+
+				// gui-94: Home con la sesion abierta -> cierre
+				// limpio y vuelta al menu principal (antes la
+				// consola cortaba el stream y el app se quedaba
+				// colgado). Por hold y no por flanco: si el
+				// overlay de Home pausa unos frames la lectura,
+				// al reanudar sigue contando.
+				if(g_session_active &&
+				   (status.hold & VPAD_BUTTON_HOME))
+				{
+					logprintf("Home: cerrando sesion, vuelta al menu");
+					// gui-95: sin GX2DrawDone - si el
+					// sistema ya nos paso a background
+					// DrawDone puede DSI y dejar la
+					// consola congelada.
+					stop_session(true);
+				}
 
 				// Modal de borrado sin navegacion: A
 				// confirma, B vuelve; el resto se ignora.
@@ -3975,24 +4715,11 @@ int main(int argc, char **argv)
 					// Fase 4c: en Ajustes las teclas del
 					// menu quedan consumidas; B cierra.
 					else if(rising & VPAD_BUTTON_B)
-					{
-						// Cierre animado (gui-80):
-						// g_settings_open sigue
-						// true hasta que la hoja
-						// termine de hundirse.
-						g_set_anim =
-							SetAnim::Closing;
-						g_set_anim_t0 = OSGetTime();
-						g_set_touch_prev = false;
-						logprintf("Ajustes: cerrados");
-					}
+						settings_close_anim("B");
 					else if(rising & VPAD_BUTTON_DOWN)
-						g_set_sel = (g_set_sel + 1) %
-							     SET_ROWS;
+						settings_sel_move(1);
 					else if(rising & VPAD_BUTTON_UP)
-						g_set_sel = (g_set_sel +
-							      SET_ROWS - 1) %
-							     SET_ROWS;
+						settings_sel_move(-1);
 					else if(rising & VPAD_BUTTON_A)
 						settings_activate(g_set_sel);
 					// ZL/ZR: atajo de calidad —
@@ -4019,6 +4746,10 @@ int main(int argc, char **argv)
 							settings_toggle_vsync();
 						else if(g_set_sel == SET_ROW_LOG)
 							settings_toggle_log();
+						else if(g_set_sel == SET_ROW_VIBRATION)
+							settings_toggle_vibration();
+						else if(g_set_sel == SET_ROW_MANDO)
+							settings_toggle_mando();
 					}
 				}
 				else if(rising & VPAD_BUTTON_X)
@@ -4152,9 +4883,9 @@ int main(int argc, char **argv)
 			bool touched = tp.touched != 0;
 			if(touched && !g_set_touch_prev)
 			{
-				// Menu contextual (gui-61): toque en una
-				// fila la elige; fuera del panel cierra
-				// (como B).
+				// Inicio del toque: en Ajustes el gesto se decide al
+				// soltar (toque = fila, arrastre = scroll); el menu de
+				// presets sigue tocando al pulsar.
 				if(g_qual_menu_open)
 				{
 					int px, py, pw, ph, mrow;
@@ -4181,24 +4912,39 @@ int main(int argc, char **argv)
 						logprintf(
 							"Calidad: menu cerrado");
 					}
+					g_set_drag_moved = true; // el toque lo consumio
 				}
 				else
 				{
-					int list_y, row_h;
-					settings_row_geom(854, 480, &list_y,
-							  &row_h);
-					if((int)tp.y >= list_y)
-					{
-						int row = ((int)tp.y -
-							   list_y) /
-							  row_h;
-						if(row < SET_ROWS)
-						{
-							g_set_sel = row;
-							settings_activate(row);
-						}
-					}
+					g_set_drag_y = (int)tp.y;
+					g_set_drag_x = (int)tp.x;
+					g_set_drag_f0 = g_set_scroll;
+					g_set_drag_ly = (int)tp.y;
+					g_set_drag_lt = OSGetTime();
+					g_set_drag_moved = false;
 				}
+			}
+			else if(touched && g_set_touch_prev)
+			{
+				// Mantenido: umbral de arrastre y seguimiento del dedo.
+				if(!g_qual_menu_open)
+				{
+					int dy = (int)tp.y - g_set_drag_y;
+					if(!g_set_drag_moved &&
+					   (dy >= SET_DRAG_PX || -dy >= SET_DRAG_PX))
+					{
+						g_set_drag_moved = true;
+						g_set_dragging = true;
+					}
+					if(g_set_drag_moved)
+						settings_drag_to((int)tp.y);
+				}
+			}
+			else if(!touched && g_set_touch_prev)
+			{
+				// Soltar: inercia del arrastre o activar la fila.
+				if(!g_qual_menu_open)
+					settings_touch_release(g_set_drag_x, g_set_drag_ly);
 			}
 			g_set_touch_prev = touched;
 		}
@@ -4871,64 +5617,109 @@ int main(int argc, char **argv)
 		// #121212, el MISMO gris del fondo del menu — antes era el
 		// "azul discovery" pulsante y se veia como un brillo azul en
 		// los primeros frames hasta que el frame se asentaba.
-		uint64_t ticks = OSGetTime();
-		float pulse = 0.5f + 0.5f * (float)((ticks >> 24) & 0xff) / 255.0f;
-		float clear_r = 0.07f, clear_g = 0.07f, clear_b = 0.07f;
-		if(g_session_active)
+		// gui-95: pausa de render mientras el overlay de Home tiene
+		// el primer plano (ReleaseForeground). WHBProcIsRunning
+		// sigue dando true en background y aqui seguiamos mandando
+		// GX2: al volver de Home la salida se quedaba congelada
+		// (bucle vivo, pantalla parada) y un segundo Home daba
+		// negro. WHBGfx solo con primer plano; ProcUIInForeground()
+		// es el getter oficial que WHBProc* oculta.
+		if(ProcUIInForeground())
 		{
-			clear_r = 0.05f;
-			clear_g = 0.15f + 0.35f * pulse;
-			clear_b = 0.1f;
+			uint64_t ticks = OSGetTime();
+			float pulse = 0.5f + 0.5f * (float)((ticks >> 24) & 0xff) / 255.0f;
+			// gui-100: la pantalla de conexion (sesion activa sin
+			// video aun) pasa de verde pulsante a negro #121212 del
+			// menu, con la tarjeta Conectando encima; el verde queda
+			// solo cuando ya hay stream (por debajo del video, solo
+			// visible en los huecos de decodificacion).
+			float clear_r = 0.07f, clear_g = 0.07f, clear_b = 0.07f;
+			if(g_session_active && g_video_frames > 0)
+			{
+				clear_r = 0.05f;
+				clear_g = 0.15f + 0.35f * pulse;
+				clear_b = 0.1f;
+			}
+
+			// Subida del frame de video UNA vez por vuelta y FUERA de
+			// los pases WHBGfx: los passes solo dibujan el par ya
+			// subido (gui-40 subia dentro de cada pass => 2 copias
+			// por vuelta, ~15.6 ms y bucle a 21 Hz).
+			if(g_session_active && !g_mando_session)
+				wiiu_video_upload();
+
+			WHBGfxBeginRender();
+
+			WHBGfxBeginRenderTV();
+			WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
+			if(g_session_active)
+			{
+				// Modo mando (gui-102): la TV queda negra (clear
+				// #121212, sin tarjeta): el jugador mira su
+				// consola.
+				if(!g_mando_session)
+				{
+					wiiu_video_render(1920, 1080);
+					// Sin muestra de video aun: tarjeta
+					// "Conectando".
+					if(g_video_frames == 0)
+						draw_connecting(1920, 1080);
+				}
+				// Parada y micrófono solo en el DRC (gui-67): en la
+				// TV se bugueaban y encima la TV no tiene táctil —
+				// se tocan en la pantalla de abajo. El surface del
+				// touchpad tampoco se pinta aquí (no tapa el juego).
+			}
+			else
+				draw_menu_any(1920, 1080);
+			if(g_swkbd_visible)
+				nn::swkbd::DrawTV();
+			WHBGfxFinishRenderTV();
+
+			WHBGfxBeginRenderDRC();
+			WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
+			if(g_session_active)
+			{
+				// Modo mando (gui-102): tarjeta de estado; parar,
+				// micro y touchpad igual que siempre.
+				if(g_mando_session)
+				{
+					if(g_session_connected)
+						draw_mando_card(854, 480);
+					else
+						draw_connecting(854, 480);
+				}
+				else
+				{
+					wiiu_video_render(854, 480);
+					if(g_video_frames == 0)
+						draw_connecting(854, 480);
+				}
+				draw_stop_button(854, 480);
+				draw_mic_button(854, 480);
+				draw_touchpad(854, 480);
+			}
+			else
+				draw_menu_any(854, 480);
+			if(g_swkbd_visible)
+				nn::swkbd::DrawDRC();
+			WHBGfxFinishRenderDRC();
+
+			WHBGfxFinishRender();
+
+			// gui-99: fin del resync - restaura la preferencia
+			// de VSync del usuario tras los frames confirmados
+			// por el retrazador.
+			if(g_pui_resync_frames > 0 && --g_pui_resync_frames == 0)
+			{
+				GX2SetSwapInterval((uint32_t)g_config.vsync);
+				logprintf("Resync display: listo, VSync=%d"
+					  " del usuario", g_config.vsync);
+			}
 		}
-
-		// Subida del frame de video UNA vez por vuelta y FUERA de
-		// los pases WHBGfx: los passes solo dibujan el par ya
-		// subido (gui-40 subia dentro de cada pass => 2 copias
-		// por vuelta, ~15.6 ms y bucle a 21 Hz).
-		if(g_session_active)
-			wiiu_video_upload();
-
-		WHBGfxBeginRender();
-
-		WHBGfxBeginRenderTV();
-		WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
-		if(g_session_active)
-		{
-			wiiu_video_render(1920, 1080);
-			// Sin muestra de video aun: tarjeta "Conectando".
-			if(g_video_frames == 0)
-				draw_connecting(1920, 1080);
-			// Parada y micrófono solo en el DRC (gui-67): en la
-			// TV se bugueaban y encima la TV no tiene táctil —
-			// se tocan en la pantalla de abajo. El surface del
-			// touchpad tampoco se pinta aquí (no tapa el juego).
-		}
-		else
-			draw_menu_any(1920, 1080);
-		if(g_swkbd_visible)
-			nn::swkbd::DrawTV();
-		WHBGfxFinishRenderTV();
-
-		WHBGfxBeginRenderDRC();
-		WHBGfxClearColor(clear_r, clear_g, clear_b, 1.0f);
-		if(g_session_active)
-		{
-			wiiu_video_render(854, 480);
-			if(g_video_frames == 0)
-				draw_connecting(854, 480);
-			draw_stop_button(854, 480);
-			draw_mic_button(854, 480);
-			draw_touchpad(854, 480);
-		}
-		else
-			draw_menu_any(854, 480);
-		if(g_swkbd_visible)
-			nn::swkbd::DrawDRC();
-		WHBGfxFinishRenderDRC();
-
-		WHBGfxFinishRender();
 	}
 
+	wiiu_rumble_halt(); // gui-93: motor al reposo al salir
 	logprintf("chiaki-ng Wii U: shutting down");
 
 	// Orden inverso al arranque: sesion -> registro -> discovery -> teclado
