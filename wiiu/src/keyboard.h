@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include <chiaki/controller.h>
 
@@ -22,6 +23,15 @@ bool keyboard_init(void);
 
 // Dispositivos boot-keyboard conectados ahora mismo.
 int keyboard_present(void);
+
+// Latido de presencia (~2 s): sondeo SET_IDLE contra el
+// dispositivo (ver kb_probe_cb en keyboard.cpp).
+void keyboard_tick(void);
+
+// Descola un evento crudo del driver (attach/detach/fallos
+// de lectura o sondeo) para que main lo loguee; false si
+// no queda ninguno pendiente.
+bool keyboard_take_event(char *buf, size_t buf_size);
 
 // "vvvv:pppp" del primer teclado detectado (para el log).
 const char *keyboard_desc(void);

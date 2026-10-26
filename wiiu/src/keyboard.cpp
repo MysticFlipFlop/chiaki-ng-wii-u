@@ -27,17 +27,32 @@
 
 #include <chiaki/thread.h>
 
+#include <coreinit/time.h> // OSGetTime/OSMillisecondsToTicks
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #define KB_SLOTS 2
 
+// Fallos consecutivos (lectura o sondeo) = se retira el
+// teclado; un error aislado se re-arma y se perdona.
+#define KB_ERR_LIMIT 2
+
+// Periodo del sondeo de presencia con SET_IDLE.
+#define KB_PROBE_MS 2000
+
 struct KbSlot
 {
 	bool used;
 	uint32_t handle;
-	uint8_t rbuf[8]; // buffer de lectura activa (estatica: vive aqui)
+	uint16_t vid;
+	uint16_t pid;
+	uint8_t iface;    // interfaceIndex para los sondeos
+	uint8_t rbuf[8];  // buffer de lectura activa (estatica: vive aqui)
 	bool held[256];
+	int errs;         // fallos consecutivos (lectura/sondeo)
+	bool probe_busy;  // sondeo en vuelo (no solapar)
+	uint64_t last_probe;
 };
 
 static HIDClient g_kb_client;
@@ -46,6 +61,28 @@ static bool g_kb_held[256]; // union de las ranuras (bajo g_kb_mu)
 static int g_kb_count;
 static char g_kb_desc[32];
 static ChiakiMutex g_kb_mu;
+
+// Cola de eventos crudos del driver (attach/detach/fallos)
+// para que main los loguee aunque no cambie el recuento:
+// ring de 4 bajo el mismo mutex; si se llena, el nuevo se
+// descarta (los sucesos importantes se repiten por ciclo).
+#define KB_EV_MAX 4
+#define KB_EV_LEN 72
+static char g_kb_ev[KB_EV_MAX][KB_EV_LEN];
+static int g_kb_ev_head;
+static int g_kb_ev_count;
+
+static void kb_note_locked(const char *fmt, ...)
+{
+	if(g_kb_ev_count >= KB_EV_MAX)
+		return;
+	char *dst = g_kb_ev[(g_kb_ev_head + g_kb_ev_count) % KB_EV_MAX];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(dst, KB_EV_LEN, fmt, ap);
+	va_end(ap);
+	g_kb_ev_count++;
+}
 
 // Reconstruye la union desde las ranuras. Llamar con el mutex tomado.
 static void kb_rebuild_union_locked(void)
@@ -61,6 +98,20 @@ static void kb_rebuild_union_locked(void)
 	}
 }
 
+// Libera una ranura y mantiene recuento/union al dia.
+// Llamar con el mutex tomado.
+static void kb_drop_slot_locked(int s)
+{
+	KbSlot *sl = &g_kb_slots[s];
+	sl->used = false;
+	sl->errs = 0;
+	sl->probe_busy = false;
+	memset(sl->held, 0, sizeof(sl->held));
+	if(g_kb_count > 0)
+		g_kb_count--;
+	kb_rebuild_union_locked();
+}
+
 static void kb_read_cb(uint32_t handle, int32_t error, uint8_t *buf,
 		       uint32_t n, void *userContext);
 
@@ -74,18 +125,38 @@ static int32_t kb_attach_cb(HIDClient *client, HIDDevice *device,
 	if(attach == HID_DEVICE_DETACH)
 	{
 		chiaki_mutex_lock(&g_kb_mu);
-		for(int s = 0; s < KB_SLOTS; s++)
+		int s = -1;
+		for(int i = 0; i < KB_SLOTS; i++)
+			if(g_kb_slots[i].used &&
+			   g_kb_slots[i].handle == device->handle)
+			{
+				s = i;
+				break;
+			}
+		if(s < 0)
 		{
-			KbSlot *sl = &g_kb_slots[s];
-			if(!sl->used || sl->handle != device->handle)
-				continue;
-			sl->used = false;
-			memset(sl->held, 0, sizeof(sl->held));
-			if(g_kb_count > 0)
-				g_kb_count--;
-			kb_rebuild_union_locked();
-			break;
+			// El handle del detach no siempre cuadra con el del
+			// attach: empareja por vid:pid (caso tipico de un
+			// solo teclado enchufado).
+			for(int i = 0; i < KB_SLOTS; i++)
+				if(g_kb_slots[i].used &&
+				   g_kb_slots[i].vid == device->vid &&
+				   g_kb_slots[i].pid == device->pid)
+				{
+					s = i;
+					break;
+				}
+			if(s >= 0)
+				kb_note_locked("detach sin handle; emparejado %04x:%04x",
+					       (unsigned)device->vid,
+					       (unsigned)device->pid);
+			else
+				kb_note_locked("detach %04x:%04x sin ranura",
+					       (unsigned)device->vid,
+					       (unsigned)device->pid);
 		}
+		if(s >= 0)
+			kb_drop_slot_locked(s);
 		chiaki_mutex_unlock(&g_kb_mu);
 		return 0;
 	}
@@ -118,6 +189,12 @@ static int32_t kb_attach_cb(HIDClient *client, HIDDevice *device,
 		g_kb_count++;
 	}
 	sl->handle = device->handle;
+	sl->vid = device->vid;
+	sl->pid = device->pid;
+	sl->iface = device->interfaceIndex;
+	sl->errs = 0;
+	sl->probe_busy = false;
+	sl->last_probe = OSGetTime(); // primer sondeo ~2 s despues
 	if(g_kb_count == 1)
 		snprintf(g_kb_desc, sizeof(g_kb_desc), "%04x:%04x",
 			 device->vid, device->pid);
@@ -137,7 +214,28 @@ static void kb_read_cb(uint32_t handle, int32_t error, uint8_t *buf,
 	bool rearm = false;
 
 	chiaki_mutex_lock(&g_kb_mu);
-	if(!error && sl->used && sl->handle == handle && n >= 2)
+	if(!sl->used || sl->handle != handle)
+	{
+		// Ranura liberada o handle viejo: sin re-arme.
+		chiaki_mutex_unlock(&g_kb_mu);
+		return;
+	}
+	if(error || n < 2)
+	{
+		// Al retirar el teclado la lectura pendiente falla y el
+		// evento detach no siempre llega: cuenta el fallo, rearma
+		// y a KB_ERR_LIMIT seguidos retira el dispositivo.
+		sl->errs++;
+		if(sl->errs >= KB_ERR_LIMIT)
+		{
+			kb_note_locked("lectura fallo (err %d, %u b); retirado",
+				       (int)error, (unsigned int)n);
+			kb_drop_slot_locked((int)(sl - g_kb_slots));
+		}
+		else
+			rearm = true;
+	}
+	else
 	{
 		bool now[256];
 		memset(now, 0, sizeof(now));
@@ -153,12 +251,89 @@ static void kb_read_cb(uint32_t handle, int32_t error, uint8_t *buf,
 		}
 		memcpy(sl->held, now, sizeof(sl->held));
 		kb_rebuild_union_locked();
+		sl->errs = 0;
 		rearm = true;
 	}
 	chiaki_mutex_unlock(&g_kb_mu);
 
 	if(rearm)
 		HIDRead(handle, sl->rbuf, sizeof(sl->rbuf), kb_read_cb, sl);
+}
+
+// Latido de presencia (gui-105b): mientras nadie teclea el teclado
+// no manda reportes, asi que la lectura pendiente no sirve de latido.
+// Un SET_IDLE cada KB_PROBE_MS toca el dispositivo siempre (semantica
+// "solo al cambiar": inocua) y su fallo repetido retira el teclado
+// aunque no llegue ni detach ni error de lectura.
+static void kb_probe_cb(uint32_t handle, int32_t error, uint8_t *buf,
+			uint32_t n, void *userContext)
+{
+	(void)buf;
+	(void)n;
+
+	KbSlot *sl = (KbSlot *)userContext;
+	chiaki_mutex_lock(&g_kb_mu);
+	if(sl->used && sl->handle == handle)
+	{
+		sl->probe_busy = false;
+		if(error)
+		{
+			sl->errs++;
+			if(sl->errs >= KB_ERR_LIMIT)
+			{
+				kb_note_locked("sondeo fallo (err %d); retirado",
+					       (int)error);
+				kb_drop_slot_locked((int)(sl - g_kb_slots));
+			}
+		}
+		else
+			sl->errs = 0;
+	}
+	chiaki_mutex_unlock(&g_kb_mu);
+}
+
+void keyboard_tick(void)
+{
+	uint64_t now = OSGetTime();
+	uint32_t handles[KB_SLOTS];
+	uint8_t ifaces[KB_SLOTS];
+	void *ctxs[KB_SLOTS];
+	int n = 0;
+
+	// Recolecta con el mutex tomado y lanza las llamadas fuera: si
+	// el sistema completara el callback en sincrono, no hay deadlock.
+	chiaki_mutex_lock(&g_kb_mu);
+	for(int s = 0; s < KB_SLOTS; s++)
+	{
+		KbSlot *sl = &g_kb_slots[s];
+		if(!sl->used || sl->probe_busy)
+			continue;
+		if(now - sl->last_probe < OSMillisecondsToTicks(KB_PROBE_MS))
+			continue;
+		sl->probe_busy = true;
+		sl->last_probe = now;
+		handles[n] = sl->handle;
+		ifaces[n] = sl->iface;
+		ctxs[n] = sl;
+		n++;
+	}
+	chiaki_mutex_unlock(&g_kb_mu);
+
+	for(int i = 0; i < n; i++)
+	{
+		int32_t r = HIDSetIdle(handles[i], ifaces[i], 0, 0,
+					kb_probe_cb, ctxs[i]);
+		if(r)
+		{
+			// Error inmediato (sin callback): no dejar el
+			// latido clavado; el proximo tick reintenta.
+			chiaki_mutex_lock(&g_kb_mu);
+			KbSlot *sl = (KbSlot *)ctxs[i];
+			if(sl->used && sl->probe_busy)
+				sl->probe_busy = false;
+			chiaki_mutex_unlock(&g_kb_mu);
+		}
+	}
 }
 
 bool keyboard_init(void)
@@ -185,6 +360,25 @@ int keyboard_present(void)
 	int n = g_kb_count;
 	chiaki_mutex_unlock(&g_kb_mu);
 	return n;
+}
+
+// Descola el evento mas antiguo de la cola del driver. false si no
+// hay ninguno pendiente.
+bool keyboard_take_event(char *buf, size_t buf_size)
+{
+	if(!buf || !buf_size)
+		return false;
+	chiaki_mutex_lock(&g_kb_mu);
+	if(!g_kb_ev_count)
+	{
+		chiaki_mutex_unlock(&g_kb_mu);
+		return false;
+	}
+	snprintf(buf, buf_size, "%s", g_kb_ev[g_kb_ev_head]);
+	g_kb_ev_head = (g_kb_ev_head + 1) % KB_EV_MAX;
+	g_kb_ev_count--;
+	chiaki_mutex_unlock(&g_kb_mu);
+	return true;
 }
 
 const char *keyboard_desc(void)

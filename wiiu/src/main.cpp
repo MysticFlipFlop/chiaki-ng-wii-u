@@ -2691,7 +2691,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-105"
+#define APP_BUILD_TAG "gui-105b"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -5136,6 +5136,10 @@ int main(int argc, char **argv)
 		// gui-105: transiciones del teclado USB: tarjeta, log y
 		// limpieza del menu si desaparece el dispositivo.
 		{
+			keyboard_tick();
+			char kbev[72];
+			if(keyboard_take_event(kbev, sizeof(kbev)))
+				logprintf("Teclado: %s", kbev);
 			int kb = keyboard_present();
 			if(kb != g_kb_present)
 			{
