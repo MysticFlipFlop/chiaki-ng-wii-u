@@ -11,6 +11,7 @@
 //   vibration_enabled=<0|1>                  vibracion del GamePad (default 1)
 
 //   mando_mode=<0|1|2>                       modo de sesion: 0 normal, 1 solo mando, 2 sin video (default 0)
+//   keymap=<tt:kk,...>                     mapeo teclado USB (gui-105)
 //   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>
 //
 // Una linea "console=" por consola guardada. El modulo solo serializa/
@@ -28,6 +29,11 @@
 #define CONFIG_NAME_SIZE 0x20
 #define CONFIG_HOST_SIZE 48
 #define CONFIG_MAX_CONSOLES 8
+// Objetivos de mapeo del teclado USB (gui-105): 16 botones digitales
+// (orden = bits de ChiakiControllerButton) + L2/R2 + 4+4 direcciones
+// de stick a deflexion completa. El keymap guarda target -> tecla HID
+// (0 = sin asignar).
+#define CONFIG_KEYMAP_TARGETS 26
 
 struct ConfigConsole
 {
@@ -81,6 +87,10 @@ struct Config
 	// Se elige en Ajustes (fila Modo), persiste en config.ini y
 	// aplica en la próxima sesión.
 	int mando_mode;
+	// keymap del teclado USB (gui-105): tecla HID asignada a cada
+	// target (0 = sin asignar; ver CONFIG_KEYMAP_TARGETS). Solo se
+	// usa con teclado conectado, pero los mapeos persisten siempre.
+	uint8_t keymap_keys[CONFIG_KEYMAP_TARGETS];
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
 

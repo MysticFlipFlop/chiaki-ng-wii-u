@@ -84,6 +84,7 @@
 #include "config.h"
 #include "gui.h"
 #include "audio.h"
+#include "keyboard.h"
 
 #define DISCOVERY_PING_MS 500
 #define DISCOVERY_HOSTS_MAX 8
@@ -138,6 +139,7 @@ enum {
 	SET_ROW_LOG,
 	SET_ROW_VIBRATION,
 	SET_ROW_MANDO,
+	SET_ROW_KEYBOARD,
 	SET_ROW_DELETE,
 	SET_ROWS,
 };
@@ -162,6 +164,26 @@ static int g_qual_menu_sel = 0;
 // Menu contextual del Modo (gui-103): presets de stream.
 static bool g_mando_menu_open = false;
 static int g_mando_menu_sel = 0;
+
+// Menu contextual de Teclado (gui-105): mapeo tecla USB -> boton PS.
+// 29 lineas = 3 cabeceras de seccion + 26 objetivos; g_kb_menu_sel
+// guarda LINEA (no target) y g_kb_menu_top la primera visible.
+static bool g_kb_menu_open = false;
+static int g_kb_menu_sel = 1; // linea del primer objetivo (0 = cabecera)
+static int g_kb_menu_top = 0;
+// Modal de mapeo: ventana de 10 s con hold de 3 s por tecla.
+static int g_kb_map_target = -1; // objetivo en curso (-1 = cerrado)
+static uint64_t g_kb_map_t0 = 0; // apertura (para el timeout)
+static uint64_t g_kb_map_hold_t0 = 0; // inicio del hold (0 = sin hold)
+static uint8_t g_kb_map_key = 0; // tecla previsualizada
+// Presencia y tarjeta (gui-105): transicion detectada en el bucle.
+static int g_kb_present = 0; // visto por ultima vez (0 = sin teclado)
+static int g_kb_toast_kind = 0; // 0 nada, 1 conectado, 2 desconectado
+static uint64_t g_kb_toast_t0 = 0;
+#define KB_TOAST_MS 3000
+#define KB_MAP_TIMEOUT_MS 10000
+#define KB_MAP_HOLD_MS 3000
+#define KB_MENU_LINES (CONFIG_KEYMAP_TARGETS + 3)
 
 // Dialogo modal de confirmacion de borrado (solo desde Ajustes): sin
 // navegacion — A confirma y B vuelve (como los dialogs de consola).
@@ -2290,6 +2312,12 @@ static void session_send_input(const VPADStatus &status)
 	st.right_x = stick_axis(status.rightStick.x);
 	st.right_y = stick_axis(-status.rightStick.y);
 
+	// Teclado USB (gui-105): botones/L2/R2 y sticks a deflexion
+	// completa por encima del GamePad mientras la tecla se mantenga
+	// (con el modal de mapeo abierto el envio queda suspendido).
+	if(g_kb_map_target < 0)
+		keyboard_apply(&st, g_config.keymap_keys);
+
 	// Zona touchpad superior derecha: el contacto se reinserta con su
 	// id en el estado fresco (el state nuevo arranca sin toques); el
 	// click es un pulso tras un toque corto y quieto (tap-to-click).
@@ -2663,7 +2691,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-104"
+#define APP_BUILD_TAG "gui-105"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -3260,6 +3288,25 @@ static bool g_set_drag_moved = false; // supero el umbral de arrastre
 static float g_set_bar_a = 0.f;       // alfa de la barra (0..1)
 static uint64_t g_set_bar_t = 0;      // ultimo movimiento (fin de la barra)
 
+// gui-105: la fila de Teclado solo existe con teclado conectado. Las
+// posiciones de la lista son densas (sin huecos): posicion<->id se
+// traduce con estas funciones (solo una fila puede faltar).
+static int settings_row_count(void)
+{
+	return SET_ROWS - (g_kb_present > 0 ? 0 : 1);
+}
+
+static int settings_row_id(int pos)
+{
+	return (g_kb_present <= 0 && pos >= SET_ROW_KEYBOARD) ? pos + 1
+						      : pos;
+}
+
+static int settings_pos_of(int id)
+{
+	return (g_kb_present <= 0 && id > SET_ROW_KEYBOARD) ? id - 1 : id;
+}
+
 // Rango desplazable en pixeles de una superficie (0 = la lista cabe).
 static float settings_max_px(int w, int h)
 {
@@ -3267,7 +3314,7 @@ static float settings_max_px(int w, int h)
 	settings_row_geom(w, h, &list_y, &row_h);
 	int u = 8 * ((w >= 1280) ? 2 : 1);
 	float vp = (float)(h - list_y - u * 2);
-	float max_px = (float)(SET_ROWS * row_h) - vp;
+	float max_px = (float)(settings_row_count() * row_h) - vp;
 	return (max_px > 0.f) ? max_px : 0.f;
 }
 
@@ -3286,7 +3333,7 @@ static void settings_sel_range(int row, float *lo, float *hi)
 		settings_row_geom(w, h, &list_y, &row_h);
 		int u = 8 * ((w >= 1280) ? 2 : 1);
 		float vp = (float)(h - list_y - u * 2);
-		float max_px = (float)(SET_ROWS * row_h) - vp;
+		float max_px = (float)(settings_row_count() * row_h) - vp;
 		if(max_px <= 0.f)
 			continue; // la lista cabe entera: sin restriccion
 		float f_lo = ((float)((row + 1) * row_h) - vp) / max_px;
@@ -3309,7 +3356,7 @@ static void settings_sel_range(int row, float *lo, float *hi)
 static void settings_ensure_sel_visible(void)
 {
 	float lo, hi;
-	settings_sel_range(g_set_sel, &lo, &hi);
+	settings_sel_range(settings_pos_of(g_set_sel), &lo, &hi);
 	float cur = g_set_scroll_on ? g_set_scroll_tgt : g_set_scroll;
 	if(cur < lo)
 	{
@@ -3326,7 +3373,11 @@ static void settings_ensure_sel_visible(void)
 // Movimiento de seleccion con wrap + asegurar visibilidad.
 static void settings_sel_move(int dir)
 {
-	g_set_sel = (g_set_sel + dir + SET_ROWS) % SET_ROWS;
+	// gui-105: la seleccion vive en ids de fila y el wrap va sobre
+	// las posiciones densas (la fila de Teclado puede no existir).
+	int cnt = settings_row_count();
+	int p = (settings_pos_of(g_set_sel) + dir + cnt) % cnt;
+	g_set_sel = settings_row_id(p);
 	settings_ensure_sel_visible();
 }
 
@@ -3447,6 +3498,241 @@ static void preset_menu_geom(int w, int h, int rows, int *px, int *py,
 	*ph = u * 4 + *row_h * rows + u * 3;
 	*px = (w - *pw) / 2;
 	*py = (h - *ph) / 2;
+}
+
+// ---------------------------------------------------------------------------
+// Teclado USB (gui-105): menu contextual de mapeo (tecla -> boton PS).
+// La lista agrupa en 3 secciones con cabeceras no seleccionables; el
+// panel abre con ventana desplazable porque 29 lineas no caben en 480p.
+// ---------------------------------------------------------------------------
+
+static const char *kb_target_label(int t)
+{
+	static const char *labels[CONFIG_KEYMAP_TARGETS] = {
+		"Cruz", "Círculo", "Cuadrado", "Triángulo",
+		"D-pad Izquierda", "D-pad Derecha", "D-pad Arriba",
+		"D-pad Abajo",
+		"L1", "R1", "L3", "R3", "Opciones", "Compartir",
+		"Touchpad", "PS",
+		"L2", "R2",
+		"Stick izq. arriba", "Stick izq. abajo",
+		"Stick izq. izquierda", "Stick izq. derecha",
+		"Stick der. arriba", "Stick der. abajo",
+		"Stick der. izquierda", "Stick der. derecha",
+	};
+	return (t >= 0 && t < CONFIG_KEYMAP_TARGETS) ? labels[t] : "?";
+}
+
+// Linea del menu -> objetivo (-1 = cabecera de seccion).
+static int kb_menu_target(int line)
+{
+	if(line == 0)
+		return -1;
+	if(line <= 18)
+		return line - 1; // 1..18 -> botones 0..17
+	if(line == 19)
+		return -1;
+	if(line <= 23)
+		return line - 2; // 20..23 -> sticks izq 18..21
+	if(line == 24)
+		return -1;
+	if(line <= 28)
+		return line - 3; // 25..28 -> sticks der 22..25
+	return -1;
+}
+
+static const char *kb_menu_line_text(int line)
+{
+	if(line == 0)
+		return "Botones";
+	if(line == 19)
+		return "Stick izquierdo";
+	if(line == 24)
+		return "Stick derecho";
+	return kb_target_label(kb_menu_target(line));
+}
+
+// Filas visibles de la superficie (ventana del panel).
+static int kb_menu_vis(int w, int h)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	int row_h = (scale == 2) ? u * 3 : u * 4;
+	int vis = (h - u * 4 - u * 3) / row_h;
+	return (vis < 4) ? 4 : vis;
+}
+
+static void kb_menu_geom(int w, int h, int *px, int *py, int *pw,
+			 int *ph, int *row_h, int *vis)
+{
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	*row_h = (scale == 2) ? u * 3 : u * 4;
+	*pw = u * 28;
+	*vis = kb_menu_vis(w, h);
+	int show = (KB_MENU_LINES < *vis) ? KB_MENU_LINES : *vis;
+	*ph = u * 4 + show * *row_h + u * 3;
+	*px = (w - *pw) / 2;
+	*py = (h - *ph) / 2;
+}
+
+// Mueve la seleccion con wrap saltando cabeceras y mantiene la
+// ventana visible en la superficie mas justa (la DRC).
+static void kb_menu_move(int dir)
+{
+	int vis = kb_menu_vis(854, 480);
+	int vis_tv = kb_menu_vis(1280, 720);
+	if(vis_tv < vis)
+		vis = vis_tv;
+	int line = g_kb_menu_sel;
+	do
+		line = (line + dir + KB_MENU_LINES) % KB_MENU_LINES;
+	while(kb_menu_target(line) < 0);
+	g_kb_menu_sel = line;
+	if(line < g_kb_menu_top)
+		g_kb_menu_top = line;
+	if(line >= g_kb_menu_top + vis)
+		g_kb_menu_top = line - vis + 1;
+}
+
+// Abre el modal de mapeo para el objetivo dado.
+static void kb_map_open(int target)
+{
+	g_kb_map_target = target;
+	g_kb_map_t0 = OSGetTime();
+	g_kb_map_hold_t0 = 0;
+	g_kb_map_key = 0;
+	logprintf("Teclado: mapear \"%s\" — mantén una tecla 3 s (B cancela)",
+		  kb_target_label(target));
+}
+
+static void kb_map_close(const char *how)
+{
+	g_kb_map_target = -1;
+	g_kb_map_hold_t0 = 0;
+	g_kb_map_key = 0;
+	logprintf("Teclado: mapeo cancelado (%s)", how);
+}
+
+// Por vuelta con el modal abierto: previsualiza la tecla mantenida y
+// exige un hold continuo de 3 s para guardar (timeout 10 s).
+static void kb_map_tick(void)
+{
+	if(g_kb_map_target < 0)
+		return;
+	uint64_t now = OSGetTime();
+	if(now - g_kb_map_t0 > OSMillisecondsToTicks(KB_MAP_TIMEOUT_MS))
+	{
+		g_kb_map_target = -1;
+		g_kb_map_hold_t0 = 0;
+		g_kb_map_key = 0;
+		logprintf("Teclado: mapeo cancelado (tiempo agotado)");
+		return;
+	}
+	if(g_kb_map_key && !keyboard_key_held(g_kb_map_key))
+	{
+		// Soltada: reinicia el hold; si otra tecla esta pulsada la
+		// adopta en la vuelta siguiente.
+		g_kb_map_key = 0;
+		g_kb_map_hold_t0 = 0;
+	}
+	if(!g_kb_map_key)
+	{
+		uint8_t key;
+		if(!keyboard_any_held(&key))
+			return;
+		g_kb_map_key = key;
+		g_kb_map_hold_t0 = now;
+		logprintf("Teclado: tecla detectada %s (mantén 3 s)",
+			  keyboard_key_name(key));
+		return;
+	}
+	if(!g_kb_map_hold_t0)
+		return;
+	if(now - g_kb_map_hold_t0 < OSMillisecondsToTicks(KB_MAP_HOLD_MS))
+		return;
+
+	// Hold completo: guarda. La tecla queda libre de otros objetivos.
+	int t = g_kb_map_target;
+	uint8_t key = g_kb_map_key;
+	bool replaced = g_config.keymap_keys[t] != 0;
+	for(int i = 0; i < CONFIG_KEYMAP_TARGETS; i++)
+		if(i != t && g_config.keymap_keys[i] == key)
+			g_config.keymap_keys[i] = 0;
+	g_config.keymap_keys[t] = key;
+	g_config_dirty = true;
+	logprintf("Teclado: %s ← %s%s", kb_target_label(t),
+		  keyboard_key_name(key), replaced ? " (reemplazada)" : "");
+	g_kb_map_target = -1;
+	g_kb_map_hold_t0 = 0;
+	g_kb_map_key = 0;
+}
+
+// Tarjeta de aviso (gui-105): estilo Material con icono de teclado y
+// fundido de entrada (150 ms) y salida (300 ms); 3 s en pantalla.
+static void draw_kb_toast(int w, int h)
+{
+	if(g_kb_toast_kind == 0)
+		return;
+	uint64_t el = OSGetTime() - g_kb_toast_t0;
+	if(el >= OSMillisecondsToTicks(KB_TOAST_MS))
+	{
+		g_kb_toast_kind = 0;
+		return;
+	}
+	int scale = (w >= 1280) ? 2 : 1;
+	int u = 8 * scale;
+	float a = (float)((double)el / (double)OSMillisecondsToTicks(150));
+	if(a > 1.f)
+		a = 1.f;
+	float out = (float)((double)(OSMillisecondsToTicks(KB_TOAST_MS) - el) /
+			    (double)OSMillisecondsToTicks(300));
+	if(out < a)
+		a = (out < 0.f) ? 0.f : out;
+
+	const char *title = (g_kb_toast_kind == 1) ? "Teclado conectado"
+						   : "Teclado desconectado";
+	const char *sub = (g_kb_toast_kind == 1)
+				  ? "Mapea botones en Ajustes > Teclado"
+				  : "Los mapeos se conservan";
+
+	float tw = gui_text_width(title, scale);
+	float sw = gui_text_width(sub, scale);
+	float cw = (tw > sw ? tw : sw) + (float)(u * 4);
+	float ch = (float)(u * 10);
+	float cx = ((float)w - cw) / 2.f;
+	float cy = ((float)h - ch) / 2.f;
+
+	uint32_t c_card = c_mul_a(GUI_RGBA(0x1e, 0x1e, 0x1e, 0xff), a);
+	uint32_t c_txt = c_mul_a(GUI_RGBA(0xff, 0xff, 0xff, 0xde), a);
+	uint32_t c_sub = c_mul_a(GUI_RGBA(0xff, 0xff, 0xff, 0x8a), a);
+	uint32_t c_acc = c_mul_a(GUI_RGBA(0x00, 0xa7, 0xff, 0xff), a);
+	uint32_t c_body = c_mul_a(GUI_RGBA(0x40, 0x40, 0x40, 0xff), a);
+	uint32_t c_key = c_mul_a(GUI_RGBA(0x54, 0x54, 0x54, 0xff), a);
+
+	gui_begin(w, h);
+	gui_rect(cx, cy, cw, ch, c_card);
+	// Filete accent (elevation de Material).
+	gui_rect(cx, cy, cw, (float)scale, c_acc);
+	// Icono: teclado estilizado (3 filas de 5 teclas).
+	float iw = (float)(u * 8), ih = (float)(u * 4);
+	float ix = cx + (cw - iw) / 2.f;
+	float iy = cy + (float)u;
+	gui_rect(ix, iy, iw, ih, c_body);
+	float kw = (iw - (float)(u * 3)) / 5.f;
+	float kh = (ih - (float)(u * 2)) / 3.f;
+	for(int r = 0; r < 3; r++)
+		for(int c2 = 0; c2 < 5; c2++)
+			gui_rect(ix + (float)u / 2.f +
+					 (kw + (float)u / 2.f) * (float)c2,
+				 iy + (float)u / 2.f +
+					 (kh + (float)u / 2.f) * (float)r,
+				 kw, kh, c_key);
+	gui_text(cx + (cw - tw) / 2.f, iy + ih + (float)u, title, c_txt,
+		  scale);
+	gui_text(cx + (cw - sw) / 2.f, iy + ih + (float)(u * 2), sub, c_sub,
+		  scale);
+	gui_flush();
 }
 
 // Cicla el perfil de calidad (fase 4c) en la direccion dada: ZL/ZR y
@@ -3610,6 +3896,16 @@ static void settings_activate(int row)
 		logprintf("Modo: abrir presets (Normal / Sin vídeo /"
 			  " Sin vídeo/audio)");
 	}
+	else if(row == SET_ROW_KEYBOARD)
+	{
+		// Menu contextual (gui-105): lista de objetivos con sus
+		// teclas; B cierra, A abre el modal de mapeo.
+		g_kb_menu_sel = 1; // primera linea seleccionable
+		g_kb_menu_top = 0;
+		g_kb_menu_open = true;
+		logprintf("Teclado: menu de mapeo (%d objetivos)",
+			  CONFIG_KEYMAP_TARGETS);
+	}
 	else if(row == SET_ROW_DELETE)
 	{
 		// Ultima fila de Ajustes. Cierra Ajustes (el dialogo
@@ -3643,6 +3939,10 @@ static void settings_close_anim(const char *how)
 	g_set_anim = SetAnim::Closing;
 	g_set_anim_t0 = OSGetTime();
 	g_set_touch_prev = false;
+	// gui-105: el menu/modal del teclado no sobrevive al cierre.
+	g_kb_menu_open = false;
+	if(g_kb_map_target >= 0)
+		kb_map_close("ajustes cerrados");
 	logprintf("Ajustes: cerrados (%s)", how);
 }
 
@@ -3681,6 +3981,10 @@ static void settings_drag_to(int y)
 // el scroll aplicado.
 static void settings_touch_release(int x, int y)
 {
+	// gui-105: el menu/modal del teclado manda; sin toque debajo.
+	if(g_kb_menu_open || g_kb_map_target >= 0)
+		return;
+
 	if(g_set_drag_moved)
 	{
 		g_set_dragging = false;
@@ -3707,11 +4011,11 @@ static void settings_touch_release(int x, int y)
 	float scroll_px = g_set_scroll * settings_max_px(854, 480);
 	int row = (int)floorf(((float)(y - list_y) + scroll_px) /
 			       (float)row_h);
-	if(row < 0 || row >= SET_ROWS)
+	if(row < 0 || row >= settings_row_count())
 		return;
-	g_set_sel = row;
+	g_set_sel = settings_row_id(row);
 	settings_ensure_sel_visible();
-	settings_activate(row);
+	settings_activate(g_set_sel);
 }
 
 // Avance de la transicion de Ajustes0..1 (1 si no hay animacion).
@@ -3827,14 +4131,16 @@ static void draw_menu(int w, int h)
 			 (float)cy + ((float)cd - glyph) * 0.5f, "×",
 			 c_text2, scale * 2);
 
-		for(int i = 0; i < SET_ROWS; i++)
+		int nrows = settings_row_count();
+		for(int p = 0; p < nrows; p++)
 		{
 			// Posicion con el scroll aplicado. El fundido de borde
 			// baja el alfa de la fila al entrar o salir del
 			// viewport (el gui no tiene scissor: la fila que se va
 			// se desvanece en vez de cortarse en seco) y la que
 			// esta entera fuera ni se dibuja.
-			float yf = (float)(list_y + i * row_h) - scroll_px;
+			int i = settings_row_id(p);
+			float yf = (float)(list_y + p * row_h) - scroll_px;
 			float cut_t = (float)list_y - yf;
 			float cut_b = yf + (float)row_h -
 				      (float)(list_y + vp_h);
@@ -3935,6 +4241,23 @@ static void draw_menu(int w, int h)
 				label = "Modo";
 				snprintf(value, sizeof(value), "%s",
 					 mando_mode_label(g_config.mando_mode));
+			}
+			else if(i == SET_ROW_KEYBOARD)
+			{
+				label = "Teclado";
+				int assigned = 0;
+				for(int t = 0; t < CONFIG_KEYMAP_TARGETS; t++)
+					assigned += g_config.keymap_keys[t] ? 1 : 0;
+				if(assigned > 0)
+					snprintf(value, sizeof(value),
+						 assigned == 1 ? "1 asignada"
+							       : "%d asignadas",
+						 assigned);
+				else
+				{
+					snprintf(value, sizeof(value), "sin mapear");
+					vc = c_text3;
+				}
 			}
 			else
 			{
@@ -4130,6 +4453,124 @@ static void draw_menu(int w, int h)
 				((float)w - gui_text_width(mhint, scale)) /
 					2.f,
 				(float)(h - u * 2), mhint, c_text3, scale);
+		}
+		// Menu contextual del Teclado (gui-105): panel con ventana
+		// desplazable y cabeceras de seccion.
+		if(g_kb_menu_open)
+		{
+			int px, py, pw, ph, row_h, vis;
+			kb_menu_geom(w, h, &px, &py, &pw, &ph, &row_h, &vis);
+			int top = g_kb_menu_top;
+			if(g_kb_menu_sel < top)
+				top = g_kb_menu_sel;
+			if(g_kb_menu_sel >= top + vis)
+				top = g_kb_menu_sel - vis + 1;
+			if(top + vis > KB_MENU_LINES)
+				top = KB_MENU_LINES - vis;
+			if(top < 0)
+				top = 0;
+			g_kb_menu_top = top;
+			gui_rect(0.f, 0.f, (float)w, (float)h,
+				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
+			gui_rect((float)px, (float)py, (float)pw, (float)ph,
+				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
+			gui_text((float)(px + u * 2), (float)(py + u * 2),
+				 "Teclado", c_text, scale);
+			for(int v = 0; v < vis && top + v < KB_MENU_LINES; v++)
+			{
+				int line = top + v;
+				int t = kb_menu_target(line);
+				int ry = py + u * 4 + v * row_h;
+				if(line == g_kb_menu_sel)
+				{
+					gui_rect((float)px, (float)ry,
+						 (float)pw, (float)row_h,
+						 GUI_RGBA(0x00, 0xa7, 0xff,
+							  0x59));
+					gui_rect((float)px, (float)ry,
+						 (float)(u / 2), (float)row_h,
+						 c_accent);
+				}
+				int ty = ry + (row_h - u) / 2;
+				if(t < 0)
+				{
+					// Cabecera de seccion.
+					gui_text((float)(px + u * 2), (float)ty,
+						 kb_menu_line_text(line), c_text3,
+						 scale);
+					continue;
+				}
+				gui_text((float)(px + u * 2), (float)ty,
+					 kb_menu_line_text(line), c_text, scale);
+				uint8_t k = g_config.keymap_keys[t];
+				const char *kn = k ? keyboard_key_name(k) : "—";
+				gui_text((float)(px + pw - u * 3) -
+						  gui_text_width(kn, scale),
+					 (float)ty, kn,
+					 k ? c_text2 : c_text3, scale);
+			}
+			if(g_kb_map_target < 0)
+			{
+				const char *khint =
+					"↑/↓: elegir   A: mapear   B: cerrar";
+				gui_text(((float)w -
+					  gui_text_width(khint, scale)) /
+						 2.f,
+					 (float)(h - u * 2), khint, c_text3,
+					 scale);
+			}
+		}
+
+		// Modal de mapeo (gui-105): ventana centrada con la tecla
+		// previsualizada y barra de hold de 3 s.
+		if(g_kb_map_target >= 0)
+		{
+			char title[64];
+			snprintf(title, sizeof(title), "Mapear: %s",
+				 kb_target_label(g_kb_map_target));
+			const char *kname = g_kb_map_key
+						   ? keyboard_key_name(g_kb_map_key)
+						   : "Pulsa una tecla...";
+			const char *phint = "Mantén 3 s para guardar — B cancela";
+			float tw = gui_text_width(title, scale);
+			float kw = gui_text_width(kname, scale);
+			float hw = gui_text_width(phint, scale);
+			float cw = (tw > kw ? tw : kw);
+			if(hw > cw)
+				cw = hw;
+			cw += (float)(u * 4);
+			float ch = (float)(u * 9);
+			float cx = ((float)w - cw) / 2.f;
+			float cy = ((float)h - ch) / 2.f;
+			gui_rect(0.f, 0.f, (float)w, (float)h,
+				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
+			gui_rect(cx, cy, cw, ch, GUI_RGBA(0x1e, 0x1e, 0x1e, 0xff));
+			gui_rect(cx, cy, cw, (float)scale, c_accent);
+			gui_text(cx + (cw - tw) / 2.f, cy + (float)(u * 2),
+				 title, c_text, scale);
+			gui_text(cx + (cw - kw) / 2.f, cy + (float)(u * 4),
+				 kname, g_kb_map_key ? c_accent : c_text2, scale);
+			// Barra de hold: relleno de izquierda a derecha.
+			float bw = cw - (float)(u * 4);
+			float bx = cx + (float)(u * 2);
+			float by = cy + (float)(u * 6);
+			gui_rect(bx, by, bw, (float)(u / 2),
+				 GUI_RGBA(0x40, 0x40, 0x40, 0xff));
+			float frac = 0.f;
+			if(g_kb_map_hold_t0)
+			{
+				frac = (float)((double)(OSGetTime() -
+							g_kb_map_hold_t0) /
+					       (double)OSMillisecondsToTicks(
+						       KB_MAP_HOLD_MS));
+				if(frac > 1.f)
+					frac = 1.f;
+			}
+			if(frac > 0.f)
+				gui_rect(bx, by, bw * frac, (float)(u / 2),
+					 c_accent);
+			gui_text(cx + (cw - hw) / 2.f, cy + (float)(u * 7),
+				 phint, c_text3, scale);
 		}
 		gui_flush();
 		return;
@@ -4630,7 +5071,7 @@ int main(int argc, char **argv)
 
 	// Tras log_file_init para que el marker llegue a la SD (antes solo
 	// iba a OSReport/UDP y no servia para confirmar el build desplegado).
-	logprintf("BUILD wiiu-2026-10-20 " APP_BUILD_TAG);
+	logprintf("BUILD wiiu-2026-10-25 " APP_BUILD_TAG);
 	wiiu_video_set_log(video_log_sink);
 
 	// Fase 4a: consolas registradas y cuenta guardadas en la SD. Se carga
@@ -4653,6 +5094,9 @@ int main(int argc, char **argv)
 	// que un fallo quede registrado; sin GUI el menu no se dibuja y
 	// el resto de la app sigue funcionando (las primitivas son no-op).
 	logprintf("init: gui %s", gui_init() ? "ok" : "FALLO");
+
+	logprintf("init: teclado USB %s",
+		  keyboard_init() ? "nsyshid listo" : "nsyshid NO disponible");
 
 	logprintf("Controles: A=conectar  Izq/Dcha=elegir consola  Arriba=registrar  Abajo=ajustes  SELECT=ID  X=IP  Y=broadcast  ZL/ZR=calidad (en Ajustes)  icono abajo dcha (tocar)=parar sesion");
 
@@ -4689,6 +5133,32 @@ int main(int argc, char **argv)
 		// corriendo aqui tambien llegan los logs de arranque y de
 		// menu, y el hilo de red jamas toca FS.
 		logq_drain_batch();
+		// gui-105: transiciones del teclado USB: tarjeta, log y
+		// limpieza del menu si desaparece el dispositivo.
+		{
+			int kb = keyboard_present();
+			if(kb != g_kb_present)
+			{
+				bool on = kb > 0;
+				g_kb_toast_kind = on ? 1 : 2;
+				g_kb_toast_t0 = OSGetTime();
+				if(on)
+					logprintf("Teclado: conectado (%d) [%s]",
+						  kb, keyboard_desc());
+				else
+				{
+					logprintf("Teclado: desconectado");
+					g_kb_menu_open = false;
+					if(g_kb_map_target >= 0)
+						kb_map_close("sin dispositivo");
+					if(g_set_sel == SET_ROW_KEYBOARD)
+						g_set_sel = SET_ROW_DELETE;
+				}
+				g_kb_present = kb;
+			}
+			kb_map_tick();
+		}
+
 		// Reabrir el teclado tras una entrada invalida o para encadenar
 		// formularios (ID PSN -> PIN).
 		if(g_swkbd_reopen != Prompt::None && !g_swkbd_visible)
@@ -4858,6 +5328,37 @@ int main(int argc, char **argv)
 						else if(rising &
 							VPAD_BUTTON_A)
 							mando_menu_apply();
+					}
+					else if(g_kb_map_target >= 0)
+					{
+						// Modal de mapeo (gui-105): solo B cancela; el
+						// resto (y el D-pad) queda consumido.
+						if(rising & VPAD_BUTTON_B)
+							kb_map_close("B");
+					}
+					else if(g_kb_menu_open)
+					{
+						if(rising & VPAD_BUTTON_B)
+						{
+							g_kb_menu_open = false;
+							logprintf("Teclado: menu cerrado");
+						}
+						else if(rising &
+							(VPAD_BUTTON_DOWN |
+							 VPAD_BUTTON_RIGHT |
+							 VPAD_BUTTON_ZR))
+							kb_menu_move(1);
+						else if(rising &
+							(VPAD_BUTTON_UP |
+							 VPAD_BUTTON_LEFT |
+							 VPAD_BUTTON_ZL))
+							kb_menu_move(-1);
+						else if(rising & VPAD_BUTTON_A)
+						{
+							int t = kb_menu_target(g_kb_menu_sel);
+							if(t >= 0)
+								kb_map_open(t);
+						}
 					}
 					// Fase 4c: en Ajustes las teclas del
 					// menu quedan consumidas; B cierra.
@@ -5857,6 +6358,7 @@ int main(int argc, char **argv)
 			}
 			else
 				draw_menu_any(1920, 1080);
+			draw_kb_toast(1920, 1080);
 			if(g_swkbd_visible)
 				nn::swkbd::DrawTV();
 			WHBGfxFinishRenderTV();
@@ -5892,6 +6394,7 @@ int main(int argc, char **argv)
 			}
 			else
 				draw_menu_any(854, 480);
+			draw_kb_toast(854, 480);
 			if(g_swkbd_visible)
 				nn::swkbd::DrawDRC();
 			WHBGfxFinishRenderDRC();

@@ -11,6 +11,8 @@ add_executable(chiaki-wiiu
 	src/main.cpp
 	src/video.cpp
 	src/config.cpp
+	# gui-105: teclado USB (nsyshid): estado de teclas + hotplug.
+	src/keyboard.cpp
 	src/gui.cpp
 	# Fase 3b: audio de sesion por la voz AX (snd_core2).
 	src/audio.cpp

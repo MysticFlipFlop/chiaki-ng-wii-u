@@ -165,6 +165,29 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 	if(off >= buf_size)
 		off = buf_size - 1;
 
+	// keymap (gui-105): pares "objetivo:tecla" en hex de los
+	// asignados (linea vacia si no hay ninguno).
+	if(off + 1 < buf_size)
+	{
+		char km[CONFIG_KEYMAP_TARGETS * 6 + 2];
+		size_t klen = 0;
+		km[0] = '\0';
+		for(int i = 0; i < CONFIG_KEYMAP_TARGETS; i++)
+		{
+			uint8_t k = cfg->keymap_keys[i];
+			if(!k)
+				continue;
+			klen += (size_t)snprintf(km + klen, sizeof(km) - klen,
+						 klen ? ",%02x:%02x"
+						      : "%02x:%02x",
+						 i, k);
+		}
+		int n = snprintf(buf + off, buf_size - off,
+				  "keymap=%s\n", km);
+		if(n > 0 && (size_t)n < buf_size - off)
+			off += (size_t)n;
+	}
+
 	char key_hex[CONFIG_REGIST_KEY_SIZE * 2 + 1];
 	char morning_hex[CONFIG_REGIST_KEY_SIZE * 2 + 1];
 	char acc_hex[CONFIG_ACCOUNT_ID_SIZE * 2 + 1];
@@ -233,6 +256,39 @@ static void parse_console_line(Config *cfg, const char *v, const char *vend)
 	config_set_console(cfg, host, name, key, morning, acc);
 }
 
+// keymap (gui-105): pares "objetivo:tecla" hex separados por
+// comas. Un par corrupto corta la linea; una tecla repetida gana
+// la primera asignacion.
+static void parse_keymap_line(Config *cfg, const char *v,
+			 const char *vend)
+{
+	memset(cfg->keymap_keys, 0, sizeof(cfg->keymap_keys));
+	const char *p = v;
+	while(p + 5 <= vend)
+	{
+		int th = hex_val(p[0]);
+		int tl = hex_val(p[1]);
+		int kh = hex_val(p[3]);
+		int kl = hex_val(p[4]);
+		if(p[2] != ':' || th < 0 || tl < 0 || kh < 0 || kl < 0)
+			break;
+		int t = (th << 4) | tl;
+		int k = (kh << 4) | kl;
+		if(t >= CONFIG_KEYMAP_TARGETS || k <= 0)
+			break;
+		bool dup = false;
+		for(int i = 0; i < CONFIG_KEYMAP_TARGETS; i++)
+			dup = dup || cfg->keymap_keys[i] == (uint8_t)k;
+		if(!dup)
+			cfg->keymap_keys[t] = (uint8_t)k;
+		p += 5;
+		if(p < vend && *p == ',')
+			p++;
+		else
+			break;
+	}
+}
+
 void config_parse(Config *cfg, const char *buf, size_t len)
 {
 	const char *p = buf;
@@ -287,6 +343,8 @@ void config_parse(Config *cfg, const char *buf, size_t len)
 					cfg->vibration_enabled = atoi(val) ? 1 : 0;
 				else if(!strcmp(key, "mando_mode"))
 					cfg->mando_mode = atoi(val) ? 1 : 0;
+				else if(!strcmp(key, "keymap"))
+					parse_keymap_line(cfg, val, line_end);
 				else if(!strcmp(key, "console"))
 					parse_console_line(cfg, val, line_end);
 				// claves desconocidas: se ignoran (compatibilidad
