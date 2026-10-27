@@ -1,0 +1,131 @@
+# chiaki-ng Wii U — English language pack (gui-107)
+# Copy next to config.ini:  sd:/wiiu/apps/chiaki/eng.pak
+#
+# Format (UTF-8, one entry per line):
+#   @lang=English          display name of the language (first line)
+#   # comment              ignored
+#   Spanish source=Translation
+#
+# The key is the exact Spanish literal from the code; a missing key
+# falls back to the source text. If a KEY contains '=' write it as
+# '==' (the parser splits on the first unpaired '='). Values may use
+# '=' normally. %s / %d / %.24s placeholders must be kept.
+@lang=English
+
+# --- session / cards ---
+Última sesión: detenida=Last session: stopped
+Última sesión fallida: %s — %s=Last session failed: %s — %s
+Última sesión fallida: %s=Last session failed: %s
+Conectando con %s%s=Connecting to %s%s
+la consola=the console
+para cancelar=to cancel
+Modo mando activo=Controller mode active
+El video esta en tu consola=The video is on your console
+Sin video: solo audio y mando=No video: audio and controller only
+Sin vídeo/audio=No video/audio
+Sin vídeo=No video
+Normal=Normal
+
+# --- toolbar / console list / footer ---
+PIN (↑)=PIN (↑)
+ID=ID
+IP=IP
+Buscar=Search
+Consola detectada - pulsa ↑ para registrar=Console detected - press ↑ to register
+Sin consolas registradas - pulsa ↑ con el PIN de la PS4=No registered consoles - press ↑ with the PS4 PIN
+Buscando consolas en la red...=Searching for consoles on the network...
+Dirección: %s=Address: %s
+Estado: -=State: -
+Estado: registrando...=State: registering...
+Estado: sin discovery (Y==buscar)=State: no discovery (Y=search)
+Estado: lista=State: ready
+Estado: en espera=State: standby
+Estado: discovery=State: discovering
+Despertar=Wake up
+Conectar=Connect
+Registrando... introduce el PIN que muestra la PS4=Registering... enter the PIN shown on the PS4
+↑: registrar con el PIN de la PS4=↑: register with the PS4 PIN
+←/→: elegir consola=←/→: select console
+
+# --- delete dialog ---
+No se pudo eliminar la consola=Could not delete the console
+Consola eliminada: %s=Console deleted: %s
+Sin consolas registradas - pulsa ↑ con el PIN=No registered consoles - press ↑ with the PIN
+¿Eliminar consola?=Delete console?
+Se eliminará '%.24s' de la lista.='%.24s' will be removed from the list.
+Dirección: %.32s=Address: %.32s
+volver=back
+Eliminar=Delete
+
+# --- settings sheet ---
+Ajustes=Settings
+ID PSN=PSN ID
+sin definir=not set
+IP de la PS4=PS4 IP
+sin fijar=not set
+Calidad de video=Video quality
+VSync=VSync
+Log.txt=Log.txt
+Vibración=Vibration
+Modo=Mode
+Idioma=Language
+Teclado=Keyboard
+1 asignada=1 assigned
+%d asignadas=%d assigned
+sin mapear=unmapped
+Eliminar consola=Delete console
+sin consolas=no consoles
+↑/↓: elegir   A o tocar: abrir   B: volver=↑/↓: select   A or touch: open   B: back
+
+# --- contextual menus ---
+↑/↓: elegir   A: elegir   B: cerrar=↑/↓: select   A: choose   B: close
+↑/↓: elegir   A: mapear   B: cerrar=↑/↓: select   A: map   B: close
+
+# --- keyboard mapping modal ---
+Mapear: %s=Map: %s
+Pulsa una tecla...=Press a key...
+Mantén 3 s para guardar — B cancela=Hold 3 s to save — B cancels
+Botones=Buttons
+Stick izquierdo=Left stick
+Stick derecho=Right stick
+
+# --- keyboard toast ---
+Teclado conectado=Keyboard connected
+Teclado desconectado=Keyboard disconnected
+Mapea botones en Ajustes > Teclado=Map buttons in Settings > Keyboard
+Los mapeos se conservan=Mappings are kept
+
+# --- mapping targets ---
+Cruz=Cross
+Círculo=Circle
+Cuadrado=Square
+Triángulo=Triangle
+D-pad Izquierda=D-pad Left
+D-pad Derecha=D-pad Right
+D-pad Arriba=D-pad Up
+D-pad Abajo=D-pad Down
+L1=L1
+R1=R1
+L3=L3
+R3=R3
+Opciones=Options
+Compartir=Share
+Touchpad=Touchpad
+PS=PS
+L2=L2
+R2=R2
+Stick izq. arriba=Left stick up
+Stick izq. abajo=Left stick down
+Stick izq. izquierda=Left stick left
+Stick izq. derecha=Left stick right
+Stick der. arriba=Right stick up
+Stick der. abajo=Right stick down
+Stick der. izquierda=Right stick left
+Stick der. derecha=Right stick right
+
+# --- system keyboard (swkbd) hints ---
+IP de la consola (ej. 192.168.1.10)=Console IP (e.g. 192.168.1.10)
+Tu ID publico de PSN (nombre de usuario)=Your public PSN ID (online ID)
+Account ID PSN en base64 (ej. wLEMeFoyimY==)=PSN Account ID in base64 (e.g. wLEMeFoyimY=)
+PIN de 8 digitos mostrado en la PS4=8-digit PIN shown on the PS4
+PIN de acceso configurado en la PS4=Passcode set on the PS4

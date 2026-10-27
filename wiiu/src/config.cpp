@@ -157,11 +157,12 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 		return 0;
 
 	size_t off = (size_t)snprintf(buf, buf_size,
-				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\nvsync=%d\nmic_gain=%d\nlog_enabled=%d\nvibration_enabled=%d\nmando_mode=%d\n",
+				      "account_id=%s\nlast_host=%s\nvideo_preset=%d\nvsync=%d\nmic_gain=%d\nlog_enabled=%d\nvibration_enabled=%d\nmando_mode=%d\nlang=%s\n",
 				      cfg->account_id_hex, cfg->last_host,
 				      cfg->video_preset, cfg->vsync,
 				      cfg->mic_gain_pct, cfg->log_enabled,
-				      cfg->vibration_enabled, cfg->mando_mode);
+				      cfg->vibration_enabled, cfg->mando_mode,
+				      cfg->lang);
 	if(off >= buf_size)
 		off = buf_size - 1;
 
@@ -309,7 +310,10 @@ void config_parse(Config *cfg, const char *buf, size_t len)
 							      (size_t)(line_end - p));
 			if(eq)
 			{
-				char key[16];
+				// gui-107: era key[16] y "vibration_enabled" mide 17
+				// caracteres: se truncaba y la vibracion nunca se
+				// recargaba del ini.
+				char key[24];
 				field_copy(key, sizeof(key), p, eq);
 				const char *val = eq + 1;
 				if(!strcmp(key, "account_id"))
@@ -342,7 +346,16 @@ void config_parse(Config *cfg, const char *buf, size_t len)
 				else if(!strcmp(key, "vibration_enabled"))
 					cfg->vibration_enabled = atoi(val) ? 1 : 0;
 				else if(!strcmp(key, "mando_mode"))
-					cfg->mando_mode = atoi(val) ? 1 : 0;
+				{
+					// gui-107: era `atoi ? 1 : 0` y el modo 2
+					// (sin video) volvia como 1 (sin
+					// audio/video) al recargar.
+					int v = atoi(val);
+					cfg->mando_mode = (v < 0 || v > 2) ? 0 : v;
+				}
+				else if(!strcmp(key, "lang"))
+					field_copy(cfg->lang, sizeof(cfg->lang),
+						   val, line_end);
 				else if(!strcmp(key, "keymap"))
 					parse_keymap_line(cfg, val, line_end);
 				else if(!strcmp(key, "console"))

@@ -12,6 +12,9 @@
 
 //   mando_mode=<0|1|2>                       modo de sesion: 0 normal, 1 solo mando, 2 sin video (default 0)
 //   keymap=<tt:kk,...>                     mapeo teclado USB (gui-105)
+//   lang=<id>                              idioma UI: vacio=auto
+//                                          (eng si hay eng.pak, si no
+//                                          esp) (gui-107)
 //   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>
 //
 // Una linea "console=" por consola guardada. El modulo solo serializa/
@@ -91,6 +94,12 @@ struct Config
 	// target (0 = sin asignar; ver CONFIG_KEYMAP_TARGETS). Solo se
 	// usa con teclado conectado, pero los mapeos persisten siempre.
 	uint8_t keymap_keys[CONFIG_KEYMAP_TARGETS];
+	// Idioma de la UI (gui-107): id corto del pak ("eng") o vacio =
+	// auto (ingles si hay eng.pak en la SD, si no espanol). Se
+	// resuelve al arrancar y se persiste al cambiarlo en Ajustes
+	// (fila Idioma). Solo afecta a textos visibles; el log sigue
+	// en espanol.
+	char lang[8];
 	ConfigConsole consoles[CONFIG_MAX_CONSOLES];
 };
 

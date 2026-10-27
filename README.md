@@ -93,8 +93,10 @@ The GamePad presents itself to the PS4 as a DualShock 4 with a **physical-positi
 | Path (SD) | Contents |
 |---|---|
 | `sd:/wiiu/apps/chiaki/log.txt` | Full app and chiaki-lib log (INFO/WARNING/ERROR) |
-| `sd:/wiiu/apps/chiaki/config.ini` | Account ID, last console, quality preset, VSync, and microphone gain |
+| `sd:/wiiu/apps/chiaki/config.ini` | Account ID, last console, quality preset, VSync, microphone gain, mode, and UI language |
+| `sd:/wiiu/apps/chiaki/eng.pak` | English UI texts (optional — plain-text `key=value` lines, UTF-8) |
 
+- **Language**: English is the default when `eng.pak` is present at `sd:/wiiu/apps/chiaki/eng.pak`. Without it the app runs in Spanish and *Settings → Language* offers only Spanish. Switch instantly from *Settings → Language*; the choice is stored in `config.ini` (`lang=`). Any `*.pak` dropped in that folder is picked up automatically (future languages need no code change).
 - WHB crash handler: panic, registers, and backtrace are dumped to the SD log
 - Clean exit with **HOME**
 - I recommend that you have an ftp or file explorer on the Wii u to delete the log because it can get too heavy. I will fix that later.

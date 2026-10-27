@@ -139,6 +139,7 @@ enum {
 	SET_ROW_LOG,
 	SET_ROW_VIBRATION,
 	SET_ROW_MANDO,
+	SET_ROW_LANG,
 	SET_ROW_KEYBOARD,
 	SET_ROW_DELETE,
 	SET_ROWS,
@@ -349,6 +350,7 @@ static bool g_swkbd_visible = false;
 static Prompt g_prompt = Prompt::None;
 static Prompt g_swkbd_reopen = Prompt::None;
 static char16_t g_swkbd_initial[40];
+static char16_t g_swkbd_hint[96]; // hint traducido (gui-107)
 // true cuando el Account ID se pide DENTRO del flujo de regist (↑):
 // ahi guardar encadena al PIN; con SELECT (edicion libre) no.
 static bool g_accountid_regist_flow = false;
@@ -985,6 +987,392 @@ static void u16_from_ascii(char16_t *dst, size_t dst_size, const char *src)
 	dst[i] = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Internacionalizacion (gui-107): textos VISIBLES en idiomas externos.
+//
+// El espanol de los literales del codigo es la FUENTE y siempre esta
+// disponible; cada fichero *.pak detectado en la SD de la app anade un
+// idioma mas (hoy solo eng.pak; fra.pak/deu.pak... se anaden solos al
+// copiarlos). Formato (UTF-8, una entrada por linea):
+//
+//   @lang=English                      nombre visible del idioma
+//   # comentario                        se ignora
+//   Calidad de video=Video Quality     literal español = traduccion
+//
+// Si una CLAVE contiene '=' se escribe como '==' (el parser corta en el
+// primer '=' que no este emparejado y despues lo colapsa). Las lineas
+// que falren en el pak se muestran con el literal fuente. Predeterminado:
+// ingles si hay eng.pak; sin ningun pak la app queda en espanol y la
+// fila Idioma de Ajustes solo ofrece espanol. Solo lo que se DIBUJA:
+// los logprintf siguen en espanol (diagnostico).
+// ---------------------------------------------------------------------------
+#define LANG_SD_DIR "/vol/external01/wiiu/apps/chiaki"
+#define LANG_MAX 8             // paks ademas de la fuente
+#define LANG_ENTS 256          // entradas del pak activo
+#define LANG_STORE_SIZE 32768  // contenido del pak activo (in situ)
+#define LANG_PROBE 1024        // ventana leida para el @lang= de cada pak
+
+static int sd_read_file(const char *path, char *buf, size_t cap);
+
+struct LangPack
+{
+	char id[8];
+	char name[48];
+};
+struct LangEnt
+{
+	uint32_t hash;
+	const char *k;
+	const char *v;
+};
+
+static LangPack g_lang_packs[LANG_MAX];
+static int g_lang_packs_n = 0;
+static int g_lang_cur = 0; // 0 = fuente (español)
+static LangEnt g_lang_ents[LANG_ENTS];
+static int g_lang_ents_n = 0;
+static char g_lang_store[LANG_STORE_SIZE] __attribute__((aligned(64)));
+
+// Declaradas antes de lang_init, que las usa para el log de arranque.
+static const char *lang_id(int i);
+static const char *lang_name(int i);
+
+// FNV-1a: descarta casi todo antes del strcmp en el lookup por frame.
+static uint32_t lang_hash(const char *s)
+{
+	uint32_t h = 2166136261u;
+	for(; *s; s++)
+	{
+		h ^= (uint8_t)*s;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+// "a.pak" -> id minusculo ("a" y "." invalidos se rechazan fuera).
+static bool lang_pak_id(const char *name, char *id, size_t id_size)
+{
+	size_t n = strlen(name);
+	if(n < 6 || n > id_size + 3)
+		return false;
+	for(int i = 0; i < 4; i++)
+	{
+		char c = name[n - 4 + i];
+		if(c >= 'A' && c <= 'Z')
+			c = (char)(c - 'A' + 'a');
+		if(c != ".pak"[i])
+			return false;
+	}
+	size_t len = n - 4;
+	for(size_t i = 0; i < len; i++)
+	{
+		char c = name[i];
+		if(c >= 'A' && c <= 'Z')
+			c = (char)(c - 'A' + 'a');
+		if(!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+			return false;
+		id[i] = c;
+	}
+	id[len] = '\0';
+	return true;
+}
+
+static int lang_find_pack(const char *id)
+{
+	for(int i = 0; i < g_lang_packs_n; i++)
+		if(!strcmp(g_lang_packs[i].id, id))
+			return i;
+	return -1;
+}
+
+// Anade un *.pak detectado por FSReadDir (id valido y sin repetir).
+static void lang_note_pak(const char *name)
+{
+	char id[8];
+	if(!lang_pak_id(name, id, sizeof(id)))
+		return;
+	if(!strcmp(id, "esp"))
+		return; // la fuente no se sustituye con un pak
+	if(g_lang_packs_n >= LANG_MAX || lang_find_pack(id) >= 0)
+		return;
+	LangPack *p = &g_lang_packs[g_lang_packs_n++];
+	snprintf(p->id, sizeof(p->id), "%s", id);
+	p->name[0] = '\0';
+}
+
+// "@lang=English" dentro de la ventana de lectura -> nombre visible;
+// si falta o esta vacio, el id en mayusculas.
+static void lang_probe_name(const char *id, const char *buf, size_t len,
+			    char *dst, size_t dst_size)
+{
+	dst[0] = '\0';
+	if(buf && len)
+	{
+		size_t win = (len < LANG_PROBE) ? len : LANG_PROBE;
+		const char *end = buf + win;
+		const char *p = buf;
+		while(p < end)
+		{
+			const char *nl = (const char *)memchr(
+				p, '\n', (size_t)(end - p));
+			const char *le = nl ? nl : end;
+			if(le - p >= 6 && !memcmp(p, "@lang=", 6))
+			{
+				const char *v = p + 6;
+				while(le > v && (le[-1] == '\r' ||
+						 le[-1] == ' ' ||
+						 le[-1] == '\t'))
+					le--;
+				size_t n = (size_t)(le - v);
+				if(n >= dst_size)
+					n = dst_size - 1;
+				memcpy(dst, v, n);
+				dst[n] = '\0';
+				if(n)
+					return;
+			}
+			if(!nl)
+				break;
+			p = nl + 1;
+		}
+	}
+	size_t i = 0;
+	for(; id[i] && i + 1 < dst_size; i++)
+		dst[i] = (char)((id[i] >= 'a' && id[i] <= 'z')
+					? id[i] - 'a' + 'A'
+					: id[i]);
+	dst[i] = '\0';
+}
+
+// Corta "clave=valor" en el PRIMER '=' que no sea un '==' (una clave
+// con '=' literal se escribe con '=='): devuelve el valor o null.
+static char *lang_split(char *line)
+{
+	for(char *p = line; *p; p++)
+	{
+		if(*p != '=')
+			continue;
+		if(p[1] == '=') // '==': '=' escapado dentro de la clave
+		{
+			p++;
+			continue;
+		}
+		*p = '\0';
+		return p + 1;
+	}
+	return nullptr;
+}
+
+// Colapsa '==' -> '=' dentro de la clave ya separada.
+static void lang_unescape(char *k)
+{
+	for(char *p = k; *p; p++)
+	{
+		if(p[0] == '=' && p[1] == '=')
+		{
+			memmove(p, p + 1, strlen(p + 1) + 1);
+			// p queda en el '=' colapsado; el ++ del for
+			// salta al siguiente caracter.
+		}
+	}
+}
+
+// Parsea el pak en sitio sobre buf (que pasa a ser la tabla).
+static void lang_parse(char *buf)
+{
+	g_lang_ents_n = 0;
+	for(char *p = buf; *p && g_lang_ents_n < LANG_ENTS;)
+	{
+		char *nl = strchr(p, '\n');
+		if(nl)
+			*nl = '\0';
+		size_t len = strlen(p);
+		while(len && (p[len - 1] == '\r' || p[len - 1] == ' ' ||
+			      p[len - 1] == '\t'))
+			p[--len] = '\0';
+		if(p[0] && p[0] != '#' && p[0] != '@')
+		{
+			char *v = lang_split(p);
+			if(v && p[0])
+			{
+				while(*v == ' ' || *v == '\t')
+					v++;
+				lang_unescape(p);
+				if(*v)
+				{
+					LangEnt *e =
+						&g_lang_ents[g_lang_ents_n++];
+					e->hash = lang_hash(p);
+					e->k = p;
+					e->v = v;
+				}
+			}
+		}
+		if(!nl)
+			break;
+		p = nl + 1;
+	}
+}
+
+// Lee y parsea el pak activo en g_lang_store (nada si es la fuente).
+static void lang_load_active(void)
+{
+	g_lang_ents_n = 0;
+	g_lang_store[0] = '\0';
+	if(g_lang_cur <= 0 || g_lang_cur > g_lang_packs_n)
+		return;
+	char path[sizeof(LANG_SD_DIR) + 16];
+	snprintf(path, sizeof(path), "%s/%s.pak", LANG_SD_DIR,
+		 g_lang_packs[g_lang_cur - 1].id);
+	int n = sd_read_file(path, g_lang_store, sizeof(g_lang_store));
+	if(n <= 0)
+	{
+		logprintf("Idioma: no se pudo leer %s (%d)", path, n);
+		return;
+	}
+	lang_parse(g_lang_store);
+	logprintf("Idioma: %s cargado (%d entradas)", path, g_lang_ents_n);
+}
+
+// Escanea la app dir buscando *.pak y fija el idioma activo.
+// pref = config.lang ("" = auto: eng si existe, si no esp).
+static void lang_init(const char *pref)
+{
+	g_lang_packs_n = 0;
+	g_lang_cur = 0;
+	g_lang_ents_n = 0;
+	g_lang_store[0] = '\0';
+
+	// Escaneo con el cliente FS del log (bajo su mutex: el logger
+	// usa TryLock y encolaria si escribimos FS a la vez). Sin FS
+	// listo no hay cliente: solo queda la fuente (español).
+	if(g_log_ready && g_log_fs_client && g_log_fs_cmd)
+	{
+		OSLockMutex(&g_log_mutex);
+		FSDirectoryHandle dh = -1;
+		FSStatus st = FSOpenDir(g_log_fs_client, g_log_fs_cmd,
+					LANG_SD_DIR, &dh, FS_ERROR_FLAG_ALL);
+		if(st >= 0)
+		{
+			for(int guard = 0; guard < 64; guard++)
+			{
+				FSDirectoryEntry ent;
+				FSStatus rs = FSReadDir(
+					g_log_fs_client, g_log_fs_cmd, dh,
+					&ent, FS_ERROR_FLAG_ALL);
+				if(rs < 0 || !ent.name[0])
+					break;
+				lang_note_pak(ent.name);
+			}
+			FSCloseDir(g_log_fs_client, g_log_fs_cmd, dh,
+				   FS_ERROR_FLAG_ALL);
+		}
+		OSUnlockMutex(&g_log_mutex);
+	}
+
+	// Idioma activo: pref explicito, o auto (eng si hay eng.pak).
+	int target = 0;
+	if(pref && pref[0])
+	{
+		if(strcmp(pref, "esp"))
+		{
+			int idx = lang_find_pack(pref);
+			if(idx >= 0)
+				target = idx + 1;
+			else
+				logprintf(
+					"Idioma: '%s' no esta en la SD — usando español",
+					pref);
+		}
+	}
+	else
+	{
+		int eng = lang_find_pack("eng");
+		target = (eng >= 0) ? eng + 1 : 0;
+	}
+
+	// Nombre visible de cada pak (cabecera @lang= en su ventana).
+	char path[sizeof(LANG_SD_DIR) + 16];
+	char probe[LANG_PROBE + 1];
+	for(int i = 0; i < g_lang_packs_n; i++)
+	{
+		snprintf(path, sizeof(path), "%s/%s.pak", LANG_SD_DIR,
+			 g_lang_packs[i].id);
+		int n = sd_read_file(path, probe, sizeof(probe) - 1);
+		lang_probe_name(g_lang_packs[i].id, probe,
+				(n > 0) ? (size_t)n : 0, g_lang_packs[i].name,
+				sizeof(g_lang_packs[i].name));
+	}
+
+	g_lang_cur = target;
+	lang_load_active();
+	logprintf("Idioma: %d pak(s) en la SD — activo %s (%s)",
+		  g_lang_packs_n, lang_id(g_lang_cur),
+		  lang_name(g_lang_cur));
+	if(g_lang_packs_n == 0)
+		logprintf(
+			"Idioma: sin *.pak en la SD — solo español disponible");
+}
+
+// Traduccion del idioma activo; el literal fuente es el fallback.
+static const char *tr(const char *src)
+{
+	if(!src || g_lang_cur == 0 || g_lang_ents_n == 0)
+		return src;
+	uint32_t h = lang_hash(src);
+	for(int i = 0; i < g_lang_ents_n; i++)
+	{
+		if(g_lang_ents[i].hash == h && !strcmp(g_lang_ents[i].k, src))
+			return g_lang_ents[i].v;
+	}
+	return src;
+}
+
+static int lang_count(void)
+{
+	return 1 + g_lang_packs_n;
+}
+
+static int lang_current(void)
+{
+	return g_lang_cur;
+}
+
+static bool lang_is_source(void)
+{
+	return g_lang_cur == 0;
+}
+
+static const char *lang_id(int i)
+{
+	if(i <= 0 || i > g_lang_packs_n)
+		return "esp";
+	return g_lang_packs[i - 1].id;
+}
+
+static const char *lang_name(int i)
+{
+	if(i <= 0 || i > g_lang_packs_n)
+		return "Espa\xC3\xB1ol";
+	return g_lang_packs[i - 1].name;
+}
+
+// Cambio al instante (tr() se consulta al dibujar) con recarga del pak.
+static void lang_set(int i)
+{
+	if(i < 0 || i >= lang_count())
+		return;
+	g_lang_cur = i;
+	lang_load_active();
+}
+
+// Hint del swkbd traducido: tr() a UTF-16 en el buffer fijo.
+static void swkbd_hint(const char *s)
+{
+	u16_from_ascii(g_swkbd_hint,
+		       sizeof(g_swkbd_hint) / sizeof(char16_t), tr(s));
+}
+
 static bool valid_ipv4(const char *s)
 {
 	unsigned int a, b, c, d;
@@ -1033,13 +1421,17 @@ static void swkbd_show(Prompt p)
 		return;
 
 	nn::swkbd::AppearArg appearArg = {};
-	appearArg.keyboardArg.configArg.languageType = nn::swkbd::LanguageType::Spanish;
+	// gui-107: el layout del teclado sigue el idioma de la app.
+	appearArg.keyboardArg.configArg.languageType =
+		lang_is_source() ? nn::swkbd::LanguageType::Spanish
+				 : nn::swkbd::LanguageType::English;
 	appearArg.inputFormArg.maxTextLength = 15;
 
 	switch(p)
 	{
 	case Prompt::IP:
-		appearArg.inputFormArg.hintText = u"IP de la consola (ej. 192.168.1.10)";
+		swkbd_hint("IP de la consola (ej. 192.168.1.10)");
+		appearArg.inputFormArg.hintText = g_swkbd_hint;
 		if(g_host_ip[0])
 		{
 			u16_from_ascii(g_swkbd_initial,
@@ -1048,7 +1440,8 @@ static void swkbd_show(Prompt p)
 		}
 		break;
 	case Prompt::PsnId:
-		appearArg.inputFormArg.hintText = u"Tu ID publico de PSN (nombre de usuario)";
+		swkbd_hint("Tu ID publico de PSN (nombre de usuario)");
+		appearArg.inputFormArg.hintText = g_swkbd_hint;
 		appearArg.inputFormArg.maxTextLength = 32;
 		if(g_psn_online_id[0])
 		{
@@ -1060,7 +1453,8 @@ static void swkbd_show(Prompt p)
 	case Prompt::AccountId:
 		// Formato unico en el UI: base64 (el que sirve la API de
 		// PSN, para copiar y pegar directo de psn.flipscreen.games).
-		appearArg.inputFormArg.hintText = u"Account ID PSN en base64 (ej. wLEMeFoyimY=)";
+		swkbd_hint("Account ID PSN en base64 (ej. wLEMeFoyimY=)");
+		appearArg.inputFormArg.hintText = g_swkbd_hint;
 		appearArg.inputFormArg.maxTextLength = 16;
 		// Prefill con el ID actual si ya hay uno (SELECT = editar):
 		// asi solo se corrigen los digitos que fallan.
@@ -1079,11 +1473,13 @@ static void swkbd_show(Prompt p)
 		}
 		break;
 	case Prompt::Pin:
-		appearArg.inputFormArg.hintText = u"PIN de 8 digitos mostrado en la PS4";
+		swkbd_hint("PIN de 8 digitos mostrado en la PS4");
+		appearArg.inputFormArg.hintText = g_swkbd_hint;
 		appearArg.inputFormArg.maxTextLength = 8;
 		break;
 	case Prompt::LoginPin:
-		appearArg.inputFormArg.hintText = u"PIN de acceso configurado en la PS4";
+		swkbd_hint("PIN de acceso configurado en la PS4");
+		appearArg.inputFormArg.hintText = g_swkbd_hint;
 		appearArg.inputFormArg.maxTextLength = 16;
 		break;
 	default:
@@ -1341,7 +1737,7 @@ static void delete_selected_console(void)
 		logprintf("Borrado: seleccion invalida (idx=%d, count=%d)",
 			  idx, count);
 		snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-			 "No se pudo eliminar la consola");
+			 tr("No se pudo eliminar la consola"));
 		return;
 	}
 
@@ -1354,7 +1750,7 @@ static void delete_selected_console(void)
 	{
 		logprintf("Borrado: config_del_console fallo (idx=%d)", idx);
 		snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-			 "No se pudo eliminar la consola");
+			 tr("No se pudo eliminar la consola"));
 		return;
 	}
 	config_save_sd();
@@ -1385,7 +1781,7 @@ static void delete_selected_console(void)
 	logprintf("Consola eliminada: '%s' (%s) — quedan %d",
 		  name[0] ? name : "?", host, count);
 	snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-		 "Consola eliminada: %s", name[0] ? name : host);
+		 tr("Consola eliminada: %s"), name[0] ? name : host);
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,15 +2080,15 @@ static void session_event_cb(ChiakiEvent *event, void *user)
 		// no veia nada en pantalla).
 		if(event->quit.reason == CHIAKI_QUIT_REASON_STOPPED)
 			snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-				 "Última sesión: detenida");
+				 tr("Última sesión: detenida"));
 		else if(event->quit.reason_str)
 			snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-				 "Última sesión fallida: %s — %s",
+				 tr("Última sesión fallida: %s — %s"),
 				 chiaki_quit_reason_string(event->quit.reason),
 				 event->quit.reason_str);
 		else
 			snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-				 "Última sesión fallida: %s",
+				 tr("Última sesión fallida: %s"),
 				 chiaki_quit_reason_string(event->quit.reason));
 		g_session_quit_received = true;
 		break;
@@ -1798,10 +2194,10 @@ static const int g_mando_menu_vals[3] = { 0, 2, 1 };
 static const char *mando_mode_label(int mode)
 {
 	if(mode == 1)
-		return "Sin vídeo/audio";
+		return tr("Sin vídeo/audio");
 	if(mode == 2)
-		return "Sin vídeo";
-	return "Normal";
+		return tr("Sin vídeo");
+	return tr("Normal");
 }
 
 // Bits del protocolo (takion.h) del preset guardado: la consola
@@ -2362,7 +2758,7 @@ static void refuse_a_empty_list(void)
 {
 	logprintf("A: lista de consolas vacia — Arriba para registrar");
 	snprintf(g_last_session_msg, sizeof(g_last_session_msg),
-		 "Sin consolas registradas - pulsa ↑ con el PIN");
+		 tr("Sin consolas registradas - pulsa ↑ con el PIN"));
 }
 
 static void handle_press_a()
@@ -2705,7 +3101,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-106"
+#define APP_BUILD_TAG "gui-107"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -2738,9 +3134,9 @@ static void draw_connecting(int w, int h)
 	static const char *dots[] = { "", ".", "..", "..." };
 	int phase = (int)((OSGetTime() >> 24) & 3);
 	char line[80];
-	snprintf(line, sizeof(line), "Conectando con %s%s",
-		 g_session_ip[0] ? g_session_ip : "la consola", dots[phase]);
-	const char *hint = "para cancelar";
+	snprintf(line, sizeof(line), tr("Conectando con %s%s"),
+		 g_session_ip[0] ? g_session_ip : tr("la consola"), dots[phase]);
+	const char *hint = tr("para cancelar");
 
 	gui_begin(w, h);
 
@@ -2775,7 +3171,7 @@ static void draw_mando_card(int w, int h, const char *sub)
 	int scale = (w >= 1280) ? 2 : 1;
 	int u = 8 * scale;
 
-	const char *title = "Modo mando activo";
+	const char *title = tr("Modo mando activo");
 
 	gui_begin(w, h);
 
@@ -3580,7 +3976,8 @@ static const char *kb_target_label(int t)
 		"Stick der. arriba", "Stick der. abajo",
 		"Stick der. izquierda", "Stick der. derecha",
 	};
-	return (t >= 0 && t < CONFIG_KEYMAP_TARGETS) ? labels[t] : "?";
+	return (t >= 0 && t < CONFIG_KEYMAP_TARGETS) ? tr(labels[t])
+						       : "?";
 }
 
 // Linea del menu -> objetivo (-1 = cabecera de seccion).
@@ -3604,11 +4001,11 @@ static int kb_menu_target(int line)
 static const char *kb_menu_line_text(int line)
 {
 	if(line == 0)
-		return "Botones";
+		return tr("Botones");
 	if(line == 19)
-		return "Stick izquierdo";
+		return tr("Stick izquierdo");
 	if(line == 24)
-		return "Stick derecho";
+		return tr("Stick derecho");
 	return kb_target_label(kb_menu_target(line));
 }
 
@@ -3750,11 +4147,11 @@ static void draw_kb_toast(int w, int h)
 	if(out < a)
 		a = (out < 0.f) ? 0.f : out;
 
-	const char *title = (g_kb_toast_kind == 1) ? "Teclado conectado"
-						   : "Teclado desconectado";
+	const char *title = (g_kb_toast_kind == 1) ? tr("Teclado conectado")
+						   : tr("Teclado desconectado");
 	const char *sub = (g_kb_toast_kind == 1)
-				  ? "Mapea botones en Ajustes > Teclado"
-				  : "Los mapeos se conservan";
+				  ? tr("Mapea botones en Ajustes > Teclado")
+				  : tr("Los mapeos se conservan");
 
 	float tw = gui_text_width(title, scale);
 	float sw = gui_text_width(sub, scale);
@@ -3904,6 +4301,24 @@ static void settings_cycle_mando(int dir)
 		  mando_mode_label(g_config.mando_mode));
 }
 
+// Cicla el idioma (gui-107): fuente (español) + cada pak detectado. El
+// cambio es al instante (tr() se consulta al dibujar) y se persiste en
+// config.ini. Con un solo idioma disponible no hay nada que ciclar.
+static void settings_cycle_lang(int dir)
+{
+	int n = lang_count();
+	if(n < 2)
+	{
+		logprintf("Idioma: sin paks en la SD (solo español)");
+		return;
+	}
+	int i = (lang_current() + dir + n) % n;
+	lang_set(i);
+	snprintf(g_config.lang, sizeof(g_config.lang), "%s", lang_id(i));
+	g_config_dirty = true;
+	logprintf("Idioma: %s (%s)", lang_name(i), lang_id(i));
+}
+
 // Accion de una fila de Ajustes (A o toque en el DRC).
 static void settings_activate(int row)
 {
@@ -3956,6 +4371,8 @@ static void settings_activate(int row)
 		logprintf("Modo: abrir presets (Normal / Sin vídeo /"
 			  " Sin vídeo/audio)");
 	}
+	else if(row == SET_ROW_LANG)
+		settings_cycle_lang(1);
 	else if(row == SET_ROW_KEYBOARD)
 	{
 		// Menu contextual (gui-105): lista de objetivos con sus
@@ -4179,7 +4596,7 @@ static void draw_menu(int w, int h)
 		float scroll_px = g_set_scroll * max_px;
 		float fade_px = (float)(u * 3);
 
-		gui_text((float)m, (float)(bar_h + u * 2), "Ajustes",
+		gui_text((float)m, (float)(bar_h + u * 2), tr("Ajustes"),
 			 c_text, scale * 2);
 		// X de cierre (gui-94/95): el × de la fuente (U+00D7, ya
 		// horneada en el atlas) centrado en la caja u*4 (32/64
@@ -4240,7 +4657,7 @@ static void draw_menu(int w, int h)
 			uint32_t vc = c_text2;
 			if(i == SET_ROW_ACCOUNT)
 			{
-				label = "ID PSN";
+				label = tr("ID PSN");
 				uint8_t id[CHIAKI_PSN_ACCOUNT_ID_SIZE];
 				char b64[13] = { 0 };
 				if(g_config.account_id_hex[0] &&
@@ -4258,64 +4675,76 @@ static void draw_menu(int w, int h)
 				else
 				{
 					snprintf(value, sizeof(value),
-						 "sin definir");
+						 tr("sin definir"));
 					vc = c_text3;
 				}
 			}
 			else if(i == SET_ROW_IP)
 			{
-				label = "IP de la PS4";
+				label = tr("IP de la PS4");
 				if(g_host_ip[0])
 					snprintf(value, sizeof(value), "%s",
 						 g_host_ip);
 				else
 				{
 					snprintf(value, sizeof(value),
-						 "sin fijar");
+						 tr("sin fijar"));
 					vc = c_text3;
 				}
 			}
 			else if(i == SET_ROW_QUALITY)
 			{
-				label = "Calidad de video";
+				label = tr("Calidad de video");
 				snprintf(value, sizeof(value), "%s",
 					 video_preset_label(video_preset_cur()));
 			}
 			else if(i == SET_ROW_VSYNC)
 			{
-				label = "VSync";
+				label = tr("VSync");
 				value[0] = '\0'; // estado: checkbox, sin texto
 			}
 			else if(i == SET_ROW_LOG)
 			{
-				label = "Log.txt";
+				label = tr("Log.txt");
 				value[0] = '\0'; // estado: checkbox, sin texto
 			}
 			else if(i == SET_ROW_VIBRATION)
 			{
-				label = "Vibración";
+				label = tr("Vibración");
 				value[0] = '\0'; // estado: checkbox, sin texto
 			}
 			else if(i == SET_ROW_MANDO)
 			{
-				label = "Modo";
+				label = tr("Modo");
 				snprintf(value, sizeof(value), "%s",
 					 mando_mode_label(g_config.mando_mode));
 			}
+			else if(i == SET_ROW_LANG)
+			{
+				label = tr("Idioma");
+				// Sin paks solo existe la fuente: el valor
+				// avisa de ello en pantalla (logprintf solo
+				// va al log). Sin tr() a proposito: con un
+				// unico idioma no hay a quien traducirlo.
+				snprintf(value, sizeof(value), "%s",
+					 lang_count() > 1
+						 ? lang_name(lang_current())
+						 : "Solo español");
+			}
 			else if(i == SET_ROW_KEYBOARD)
 			{
-				label = "Teclado";
+				label = tr("Teclado");
 				int assigned = 0;
 				for(int t = 0; t < CONFIG_KEYMAP_TARGETS; t++)
 					assigned += g_config.keymap_keys[t] ? 1 : 0;
 				if(assigned > 0)
 					snprintf(value, sizeof(value),
-						 assigned == 1 ? "1 asignada"
-							       : "%d asignadas",
+						 assigned == 1 ? tr("1 asignada")
+							       : tr("%d asignadas"),
 						 assigned);
 				else
 				{
-					snprintf(value, sizeof(value), "sin mapear");
+					snprintf(value, sizeof(value), tr("sin mapear"));
 					vc = c_text3;
 				}
 			}
@@ -4324,7 +4753,7 @@ static void draw_menu(int w, int h)
 				// Ultima fila: elimina la consola
 				// seleccionada en la lista (dialogo
 				// de confirmacion).
-				label = "Eliminar consola";
+				label = tr("Eliminar consola");
 				int cnt = config_console_count(&g_config);
 				if(cnt > 0)
 				{
@@ -4340,7 +4769,7 @@ static void draw_menu(int w, int h)
 				else
 				{
 					snprintf(value, sizeof(value),
-						 "sin consolas");
+						 tr("sin consolas"));
 					vc = c_text3;
 				}
 			}
@@ -4421,7 +4850,7 @@ static void draw_menu(int w, int h)
 		   !g_kb_menu_open)
 		{
 			const char *hint =
-				"↑/↓: elegir   A o tocar: abrir   B: volver";
+				tr("↑/↓: elegir   A o tocar: abrir   B: volver");
 			gui_text(
 				((float)w - gui_text_width(hint, scale)) /
 					2.f,
@@ -4444,7 +4873,7 @@ static void draw_menu(int w, int h)
 				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
 			gui_text(ctx_x((float)(px + u * 2)),
 				 ctx_y((float)(py + u * 2)),
-				 "Calidad de video", ctx_col(c_text), scale);
+				 tr("Calidad de video"), ctx_col(c_text), scale);
 			int cur = video_preset_cur();
 			for(int i = 0; i < VIDEO_PRESET_COUNT; i++)
 			{
@@ -4473,7 +4902,7 @@ static void draw_menu(int w, int h)
 						 ctx_y((float)ty), "✓",
 						 ctx_col(c_accent), scale);
 			}
-			const char *qhint = "↑/↓: elegir   A: elegir   B: cerrar";
+			const char *qhint = tr("↑/↓: elegir   A: elegir   B: cerrar");
 			gui_text(
 				((float)w - gui_text_width(qhint, scale)) /
 					2.f,
@@ -4496,7 +4925,7 @@ static void draw_menu(int w, int h)
 				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
 			gui_text(ctx_x((float)(px + u * 2)),
 				 ctx_y((float)(py + u * 2)),
-				 "Modo", ctx_col(c_text), scale);
+				 tr("Modo"), ctx_col(c_text), scale);
 			for(int i = 0; i < MANDO_MODES; i++)
 			{
 				int val = g_mando_menu_vals[i];
@@ -4526,7 +4955,7 @@ static void draw_menu(int w, int h)
 						 ctx_col(c_accent), scale);
 			}
 			const char *mhint =
-				"↑/↓: elegir   A: elegir   B: cerrar";
+				tr("↑/↓: elegir   A: elegir   B: cerrar");
 			gui_text(
 				((float)w - gui_text_width(mhint, scale)) /
 					2.f,
@@ -4557,7 +4986,7 @@ static void draw_menu(int w, int h)
 				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
 			gui_text(ctx_x((float)(px + u * 2)),
 				 ctx_y((float)(py + u * 2)),
-				 "Teclado", ctx_col(c_text), scale);
+				 tr("Teclado"), ctx_col(c_text), scale);
 			for(int v = 0; v < vis && top + v < KB_MENU_LINES; v++)
 			{
 				int line = top + v;
@@ -4603,7 +5032,7 @@ static void draw_menu(int w, int h)
 			if(g_kb_map_target < 0)
 			{
 				const char *khint =
-					"↑/↓: elegir   A: mapear   B: cerrar";
+					tr("↑/↓: elegir   A: mapear   B: cerrar");
 				gui_text(((float)w -
 					  gui_text_width(khint, scale)) /
 						 2.f,
@@ -4617,12 +5046,12 @@ static void draw_menu(int w, int h)
 		if(g_kb_map_target >= 0)
 		{
 			char title[64];
-			snprintf(title, sizeof(title), "Mapear: %s",
+			snprintf(title, sizeof(title), tr("Mapear: %s"),
 				 kb_target_label(g_kb_map_target));
 			const char *kname = g_kb_map_key
 						   ? keyboard_key_name(g_kb_map_key)
-						   : "Pulsa una tecla...";
-			const char *phint = "Mantén 3 s para guardar — B cancela";
+						   : tr("Pulsa una tecla...");
+			const char *phint = tr("Mantén 3 s para guardar — B cancela");
 			float tw = gui_text_width(title, scale);
 			float kw = gui_text_width(kname, scale);
 			float hw = gui_text_width(phint, scale);
@@ -4677,10 +5106,10 @@ static void draw_menu(int w, int h)
 		const char *label;
 	};
 	const TbSeg tb_segs[] = {
-		{ 0, "PIN (↑)" },
-		{ '-', "ID" },
-		{ 'X', "IP" },
-		{ 'Y', "Buscar" },
+		{ 0, tr("PIN (↑)") },
+		{ '-', tr("ID") },
+		{ 'X', tr("IP") },
+		{ 'Y', tr("Buscar") },
 	};
 	int nseg = (int)(sizeof(tb_segs) / sizeof(tb_segs[0]));
 	float chip_d = (float)(scale * 12);
@@ -4753,7 +5182,7 @@ static void draw_menu(int w, int h)
 		{
 			// Aviso unico y directo: detectada -> ↑ registra.
 			const char *msg =
-				"Consola detectada - pulsa ↑ para registrar";
+				tr("Consola detectada - pulsa ↑ para registrar");
 			gui_text(((float)w - gui_text_width(msg, scale)) / 2.f,
 				 (float)(list_y + u * 8), msg, c_text2,
 				 scale);
@@ -4761,11 +5190,11 @@ static void draw_menu(int w, int h)
 		else
 		{
 			const char *empty =
-				"Sin consolas registradas - pulsa ↑ con el PIN de la PS4";
+				tr("Sin consolas registradas - pulsa ↑ con el PIN de la PS4");
 			gui_text(((float)w - gui_text_width(empty, scale)) / 2.f,
 				 (float)(list_y + u * 8), empty, c_text3,
 				 scale);
-			const char *seek = "Buscando consolas en la red...";
+			const char *seek = tr("Buscando consolas en la red...");
 			gui_text(((float)w - gui_text_width(seek, scale)) / 2.f,
 				 (float)(list_y + u * 10), seek, c_text3,
 				 scale);
@@ -4825,23 +5254,23 @@ static void draw_menu(int w, int h)
 				 con->name[0] ? con->name : "?", c_text,
 				 scale);
 			char line[72];
-			snprintf(line, sizeof(line), "Dirección: %s",
+			snprintf(line, sizeof(line), tr("Dirección: %s"),
 				 con->host);
 			gui_text((float)tx, (float)(ty + lh2), line, c_text2,
 				 scale);
 			const char *state;
 			if(!is_sel)
-				state = "Estado: -";
+				state = tr("Estado: -");
 			else if(g_regist_state != RegistState::Idle)
-				state = "Estado: registrando...";
+				state = tr("Estado: registrando...");
 			else if(!found)
-				state = "Estado: sin discovery (Y=buscar)";
+				state = tr("Estado: sin discovery (Y=buscar)");
 			else if(st == CHIAKI_DISCOVERY_HOST_STATE_READY)
-				state = "Estado: lista";
+				state = tr("Estado: lista");
 			else if(st == CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
-				state = "Estado: en espera";
+				state = tr("Estado: en espera");
 			else
-				state = "Estado: discovery";
+				state = tr("Estado: discovery");
 			gui_text((float)tx, (float)(ty + lh2 * 2), state,
 				 c_text2, scale);
 
@@ -4853,8 +5282,8 @@ static void draw_menu(int w, int h)
 				const char *act =
 					(found && st ==
 						 CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
-						? "Despertar"
-						: "Conectar";
+						? tr("Despertar")
+						: tr("Conectar");
 				float ax = (float)(w - m) - chip_d -
 					   chip_gap - gui_text_width(act, scale);
 				float ay = (float)(y + (row_h - u) / 2);
@@ -4880,10 +5309,10 @@ static void draw_menu(int w, int h)
 	// abajo-derecha). Con la lista vacia la pista de navegacion no
 	// aplica: se indica el flujo de registro.
 	const char *foot = g_regist_state != RegistState::Idle
-				   ? "Registrando... introduce el PIN que muestra la PS4"
+				   ? tr("Registrando... introduce el PIN que muestra la PS4")
 				   : (count <= 0
-					      ? "↑: registrar con el PIN de la PS4"
-					      : "←/→: elegir consola");
+					      ? tr("↑: registrar con el PIN de la PS4")
+					      : tr("←/→: elegir consola"));
 	gui_text((float)m, (float)(h - m - u), foot, c_text2, scale);
 	// "Ultima sesion" sube una linea mas (gui-78): junto al pie no
 	// se leia como aviso aparte.
@@ -4926,13 +5355,13 @@ static void draw_menu(int w, int h)
 
 		const ConfigConsole *dc = &g_config.consoles[sel];
 		gui_text(cx + (float)u * 2, cy + (float)u * 2,
-			 "¿Eliminar consola?", c_text, scale);
+			 tr("¿Eliminar consola?"), c_text, scale);
 		char msg[112];
-		snprintf(msg, sizeof(msg), "Se eliminará '%.24s' de la lista.",
+		snprintf(msg, sizeof(msg), tr("Se eliminará '%.24s' de la lista."),
 			 dc->name[0] ? dc->name : "?");
 		gui_text(cx + (float)u * 2, cy + (float)u * 5, msg, c_text2,
 			 scale);
-		snprintf(msg, sizeof(msg), "Dirección: %.32s", dc->host);
+		snprintf(msg, sizeof(msg), tr("Dirección: %.32s"), dc->host);
 		gui_text(cx + (float)u * 2, cy + (float)u * 7, msg, c_text3,
 			 scale);
 
@@ -4946,12 +5375,12 @@ static void draw_menu(int w, int h)
 				 'B', GUI_RGBA(0x54, 0x54, 0x54, 0xff),
 				 GUI_RGBA(0xff, 0xff, 0xff, 0xde));
 		hx += chip_d + chip_gap;
-		gui_text(hx, hy, "volver", c_text2, scale);
-		hx += gui_text_width("volver", scale) + (float)u * 2;
+		gui_text(hx, hy, tr("volver"), c_text2, scale);
+		hx += gui_text_width(tr("volver"), scale) + (float)u * 2;
 		draw_button_chip(hx, hy - (chip_d - (float)u) / 2.f, scale,
 				 'A', c_accent, c_white);
 		hx += chip_d + chip_gap;
-		gui_text(hx, hy, "Eliminar", c_text2, scale);
+		gui_text(hx, hy, tr("Eliminar"), c_text2, scale);
 	}
 
 	gui_flush();
@@ -5170,6 +5599,10 @@ int main(int argc, char **argv)
 	logprintf("init: config");
 	config_init(&g_config);
 	config_load_sd();
+	// Idiomas externos (gui-107): escanea *.pak de la SD y fija
+	// el activo (auto: eng si hay eng.pak, si no esp).
+	logprintf("init: idioma");
+	lang_init(g_config.lang);
 	// VSync (gui-59): aplicar la preferencia guardada. WHBGfxInit
 	// deja GX2SetSwapInterval(1); con 0 el swap es inmediato (menos
 	// latencia, posible tearing en TV y DRC).
@@ -5491,6 +5924,12 @@ int main(int argc, char **argv)
 							settings_toggle_vibration();
 						else if(g_set_sel == SET_ROW_MANDO)
 							settings_cycle_mando(
+								(rising &
+								 VPAD_BUTTON_RIGHT)
+									? 1
+									: -1);
+						else if(g_set_sel == SET_ROW_LANG)
+							settings_cycle_lang(
 								(rising &
 								 VPAD_BUTTON_RIGHT)
 									? 1
@@ -6514,8 +6953,8 @@ int main(int argc, char **argv)
 							854, 480,
 							(g_av_disabled &
 							 CHIAKI_AUDIO_DISABLED)
-								? "El video esta en tu consola"
-								: "Sin video: solo audio y mando");
+								? tr("El video esta en tu consola")
+								: tr("Sin video: solo audio y mando"));
 					else
 						draw_connecting(854, 480);
 				}
