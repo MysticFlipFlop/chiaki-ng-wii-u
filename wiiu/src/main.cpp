@@ -169,6 +169,20 @@ static int g_mando_menu_sel = 0;
 // 29 lineas = 3 cabeceras de seccion + 26 objetivos; g_kb_menu_sel
 // guarda LINEA (no target) y g_kb_menu_top la primera visible.
 static bool g_kb_menu_open = false;
+
+// Animacion de los menues contextuales (gui-106): pop+fundido
+// de entrada (170 ms, escala 92%->100%) y fundido de salida
+// (90 ms). Estado unico para los tres menus (solo uno puede
+// estar abierto): en la salida los flags siguen true y el
+// dibujo los borra cuando termina.
+#define CTX_OPEN_MS 170
+#define CTX_CLOSE_MS 90
+static uint64_t g_ctx_t0;        // inicio de la fase actual
+static bool g_ctx_out;           // fase de salida en curso
+static bool g_ctx_was_open;      // para detectar la apertura
+static float g_ctx_k = 1.f;      // escala del conjunto
+static float g_ctx_a = 1.f;      // alfa del conjunto
+static float g_ctx_cx, g_ctx_cy; // centro del panel
 static int g_kb_menu_sel = 1; // linea del primer objetivo (0 = cabecera)
 static int g_kb_menu_top = 0;
 // Modal de mapeo: ventana de 10 s con hold de 3 s por tecla.
@@ -2691,7 +2705,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-105b"
+#define APP_BUILD_TAG "gui-106"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -3500,6 +3514,52 @@ static void preset_menu_geom(int w, int h, int rows, int *px, int *py,
 	*py = (h - *ph) / 2;
 }
 
+// Pop Material de los menues contextuales (gui-106): el conjunto del
+// panel (fondo, filas y textos) escala g_ctx_k alrededor de su centro
+// con alfa g_ctx_a. La fuente 8x8 solo admite escalas enteras, asi que
+// los glyphes no se escalan: se desplazan con el conjunto (sin
+// pixelado ni saltos de tamano). El hint de abajo queda fuera de la
+// transformacion y solo recibe alfa.
+static void ctx_set(int px, int py, int pw, int ph)
+{
+	g_ctx_cx = (float)px + (float)pw * 0.5f;
+	g_ctx_cy = (float)py + (float)ph * 0.5f;
+}
+
+static float ctx_x(float x)
+{
+	return g_ctx_cx + (x - g_ctx_cx) * g_ctx_k;
+}
+
+static float ctx_y(float y)
+{
+	return g_ctx_cy + (y - g_ctx_cy) * g_ctx_k;
+}
+
+static float ctx_len(float v)
+{
+	return v * g_ctx_k;
+}
+
+// Color con el alfa de la animacion multiplicado (0xRRGGBBAA: el alfa
+// va en el byte bajo, ver gui.h).
+static uint32_t ctx_col(uint32_t c)
+{
+	uint32_t a = (uint32_t)((float)(c & 0xffu) * g_ctx_a);
+	return (c & 0xffffff00u) | a;
+}
+
+// Cierre animado (gui-106): la salida dura CTX_CLOSE_MS y el dibujo
+// borra los flags cuando termina.
+static void ctx_menu_close(void)
+{
+	if(!g_ctx_out)
+	{
+		g_ctx_out = true;
+		g_ctx_t0 = OSGetTime();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Teclado USB (gui-105): menu contextual de mapeo (tecla -> boton PS).
 // La lista agrupa en 3 secciones con cabeceras no seleccionables; el
@@ -3768,7 +3828,7 @@ static void quality_menu_apply(void)
 	g_config_dirty = true;
 	logprintf("Calidad: %s (aplica al reconectar)",
 		  video_preset_label(g_qual_menu_sel));
-	g_qual_menu_open = false;
+	ctx_menu_close();
 }
 
 // VSync (gui-59): alterna GX2SetSwapInterval(1/0), la espera de
@@ -3826,7 +3886,7 @@ static void mando_menu_apply(void)
 	g_config_dirty = true;
 	logprintf("Modo: %s (aplica en la próxima sesión)",
 		  mando_mode_label(g_config.mando_mode));
-	g_mando_menu_open = false;
+	ctx_menu_close();
 }
 
 // Cicla el preset del Modo con ←/→ sobre la fila, como la de
@@ -4357,7 +4417,8 @@ static void draw_menu(int w, int h)
 
 		// Sin hint de Ajustes con el menu de presets abierto: su
 		// propio hint ocupa esa linea (evita texto doble).
-		if(!g_qual_menu_open && !g_mando_menu_open)
+		if(!g_qual_menu_open && !g_mando_menu_open &&
+		   !g_kb_menu_open)
 		{
 			const char *hint =
 				"↑/↓: elegir   A o tocar: abrir   B: volver";
@@ -4375,40 +4436,49 @@ static void draw_menu(int w, int h)
 			int px, py, pw, ph, mrow;
 			preset_menu_geom(w, h, VIDEO_PRESET_COUNT, &px, &py,
 					  &pw, &ph, &mrow);
+			ctx_set(px, py, pw, ph);
 			gui_rect(0.f, 0.f, (float)w, (float)h,
-				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
-			gui_rect((float)px, (float)py, (float)pw, (float)ph,
-				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
-			gui_text((float)(px + u * 2), (float)(py + u * 2),
-				 "Calidad de video", c_text, scale);
+				 ctx_col(GUI_RGBA(0x00, 0x00, 0x00, 0x99)));
+			gui_rect(ctx_x((float)px), ctx_y((float)py),
+				 ctx_len((float)pw), ctx_len((float)ph),
+				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
+			gui_text(ctx_x((float)(px + u * 2)),
+				 ctx_y((float)(py + u * 2)),
+				 "Calidad de video", ctx_col(c_text), scale);
 			int cur = video_preset_cur();
 			for(int i = 0; i < VIDEO_PRESET_COUNT; i++)
 			{
 				int ry = py + u * 4 + i * mrow;
 				if(i == g_qual_menu_sel)
 				{
-					gui_rect((float)px, (float)ry,
-						 (float)pw, (float)mrow,
-						 GUI_RGBA(0x00, 0xa7, 0xff,
-							  0x59));
-					gui_rect((float)px, (float)ry,
-						 (float)(u / 2),
-						 (float)mrow, c_accent);
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)pw),
+						 ctx_len((float)mrow),
+						 ctx_col(GUI_RGBA(0x00, 0xa7,
+								  0xff, 0x59)));
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)(u / 2)),
+						 ctx_len((float)mrow),
+						 ctx_col(c_accent));
 				}
 				int ty = ry + (mrow - u) / 2;
-				gui_text((float)(px + u * 2), (float)ty,
-					 video_preset_label(i), c_text,
-					 scale);
+				gui_text(ctx_x((float)(px + u * 2)),
+					 ctx_y((float)ty),
+					 video_preset_label(i),
+					 ctx_col(c_text), scale);
 				if(i == cur)
-					gui_text((float)(px + pw - u * 3),
-						 (float)ty, "✓",
-						 c_accent, scale);
+					gui_text(ctx_x((float)(px + pw - u * 3)),
+						 ctx_y((float)ty), "✓",
+						 ctx_col(c_accent), scale);
 			}
 			const char *qhint = "↑/↓: elegir   A: elegir   B: cerrar";
 			gui_text(
 				((float)w - gui_text_width(qhint, scale)) /
 					2.f,
-				(float)(h - u * 2), qhint, c_text3, scale);
+				(float)(h - u * 2), qhint, ctx_col(c_text3),
+				scale);
 		}
 
 		// Menu contextual del Modo (gui-103): mismo panel que
@@ -4418,41 +4488,50 @@ static void draw_menu(int w, int h)
 			int px, py, pw, ph, mrow;
 			preset_menu_geom(w, h, MANDO_MODES, &px, &py, &pw,
 					  &ph, &mrow);
+			ctx_set(px, py, pw, ph);
 			gui_rect(0.f, 0.f, (float)w, (float)h,
-				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
-			gui_rect((float)px, (float)py, (float)pw, (float)ph,
-				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
-			gui_text((float)(px + u * 2), (float)(py + u * 2),
-				 "Modo", c_text, scale);
+				 ctx_col(GUI_RGBA(0x00, 0x00, 0x00, 0x99)));
+			gui_rect(ctx_x((float)px), ctx_y((float)py),
+				 ctx_len((float)pw), ctx_len((float)ph),
+				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
+			gui_text(ctx_x((float)(px + u * 2)),
+				 ctx_y((float)(py + u * 2)),
+				 "Modo", ctx_col(c_text), scale);
 			for(int i = 0; i < MANDO_MODES; i++)
 			{
 				int val = g_mando_menu_vals[i];
 				int ry = py + u * 4 + i * mrow;
 				if(i == g_mando_menu_sel)
 				{
-					gui_rect((float)px, (float)ry,
-						 (float)pw, (float)mrow,
-						 GUI_RGBA(0x00, 0xa7, 0xff,
-							  0x59));
-					gui_rect((float)px, (float)ry,
-						 (float)(u / 2),
-						 (float)mrow, c_accent);
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)pw),
+						 ctx_len((float)mrow),
+						 ctx_col(GUI_RGBA(0x00, 0xa7,
+								  0xff, 0x59)));
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)(u / 2)),
+						 ctx_len((float)mrow),
+						 ctx_col(c_accent));
 				}
 				int ty = ry + (mrow - u) / 2;
-				gui_text((float)(px + u * 2), (float)ty,
-					 mando_mode_label(val), c_text,
-					 scale);
+				gui_text(ctx_x((float)(px + u * 2)),
+					 ctx_y((float)ty),
+					 mando_mode_label(val),
+					 ctx_col(c_text), scale);
 				if(val == g_config.mando_mode)
-					gui_text((float)(px + pw - u * 3),
-						 (float)ty, "✓",
-						 c_accent, scale);
+					gui_text(ctx_x((float)(px + pw - u * 3)),
+						 ctx_y((float)ty), "✓",
+						 ctx_col(c_accent), scale);
 			}
 			const char *mhint =
 				"↑/↓: elegir   A: elegir   B: cerrar";
 			gui_text(
 				((float)w - gui_text_width(mhint, scale)) /
 					2.f,
-				(float)(h - u * 2), mhint, c_text3, scale);
+				(float)(h - u * 2), mhint, ctx_col(c_text3),
+				scale);
 		}
 		// Menu contextual del Teclado (gui-105): panel con ventana
 		// desplazable y cabeceras de seccion.
@@ -4460,6 +4539,7 @@ static void draw_menu(int w, int h)
 		{
 			int px, py, pw, ph, row_h, vis;
 			kb_menu_geom(w, h, &px, &py, &pw, &ph, &row_h, &vis);
+			ctx_set(px, py, pw, ph);
 			int top = g_kb_menu_top;
 			if(g_kb_menu_sel < top)
 				top = g_kb_menu_sel;
@@ -4471,11 +4551,13 @@ static void draw_menu(int w, int h)
 				top = 0;
 			g_kb_menu_top = top;
 			gui_rect(0.f, 0.f, (float)w, (float)h,
-				 GUI_RGBA(0x00, 0x00, 0x00, 0x99));
-			gui_rect((float)px, (float)py, (float)pw, (float)ph,
-				 GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff));
-			gui_text((float)(px + u * 2), (float)(py + u * 2),
-				 "Teclado", c_text, scale);
+				 ctx_col(GUI_RGBA(0x00, 0x00, 0x00, 0x99)));
+			gui_rect(ctx_x((float)px), ctx_y((float)py),
+				 ctx_len((float)pw), ctx_len((float)ph),
+				 ctx_col(GUI_RGBA(0x2e, 0x2e, 0x2e, 0xff)));
+			gui_text(ctx_x((float)(px + u * 2)),
+				 ctx_y((float)(py + u * 2)),
+				 "Teclado", ctx_col(c_text), scale);
 			for(int v = 0; v < vis && top + v < KB_MENU_LINES; v++)
 			{
 				int line = top + v;
@@ -4483,31 +4565,40 @@ static void draw_menu(int w, int h)
 				int ry = py + u * 4 + v * row_h;
 				if(line == g_kb_menu_sel)
 				{
-					gui_rect((float)px, (float)ry,
-						 (float)pw, (float)row_h,
-						 GUI_RGBA(0x00, 0xa7, 0xff,
-							  0x59));
-					gui_rect((float)px, (float)ry,
-						 (float)(u / 2), (float)row_h,
-						 c_accent);
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)pw),
+						 ctx_len((float)row_h),
+						 ctx_col(GUI_RGBA(0x00, 0xa7,
+								  0xff, 0x59)));
+					gui_rect(ctx_x((float)px),
+						 ctx_y((float)ry),
+						 ctx_len((float)(u / 2)),
+						 ctx_len((float)row_h),
+						 ctx_col(c_accent));
 				}
 				int ty = ry + (row_h - u) / 2;
 				if(t < 0)
 				{
 					// Cabecera de seccion.
-					gui_text((float)(px + u * 2), (float)ty,
-						 kb_menu_line_text(line), c_text3,
-						 scale);
+					gui_text(ctx_x((float)(px + u * 2)),
+						 ctx_y((float)ty),
+						 kb_menu_line_text(line),
+						 ctx_col(c_text3), scale);
 					continue;
 				}
-				gui_text((float)(px + u * 2), (float)ty,
-					 kb_menu_line_text(line), c_text, scale);
+				gui_text(ctx_x((float)(px + u * 2)),
+					 ctx_y((float)ty),
+					 kb_menu_line_text(line),
+					 ctx_col(c_text), scale);
 				uint8_t k = g_config.keymap_keys[t];
 				const char *kn = k ? keyboard_key_name(k) : "—";
-				gui_text((float)(px + pw - u * 3) -
+				gui_text(ctx_x((float)(px + pw - u * 3)) -
 						  gui_text_width(kn, scale),
-					 (float)ty, kn,
-					 k ? c_text2 : c_text3, scale);
+					 ctx_y((float)ty), kn,
+					 k ? ctx_col(c_text2)
+					   : ctx_col(c_text3),
+					 scale);
 			}
 			if(g_kb_map_target < 0)
 			{
@@ -4516,8 +4607,8 @@ static void draw_menu(int w, int h)
 				gui_text(((float)w -
 					  gui_text_width(khint, scale)) /
 						 2.f,
-					 (float)(h - u * 2), khint, c_text3,
-					 scale);
+					 (float)(h - u * 2), khint,
+					 ctx_col(c_text3), scale);
 			}
 		}
 
@@ -5071,7 +5162,7 @@ int main(int argc, char **argv)
 
 	// Tras log_file_init para que el marker llegue a la SD (antes solo
 	// iba a OSReport/UDP y no servia para confirmar el build desplegado).
-	logprintf("BUILD wiiu-2026-10-25 " APP_BUILD_TAG);
+	logprintf("BUILD wiiu-2026-10-26 " APP_BUILD_TAG);
 	wiiu_video_set_log(video_log_sink);
 
 	// Fase 4a: consolas registradas y cuenta guardadas en la SD. Se carga
@@ -5152,7 +5243,7 @@ int main(int argc, char **argv)
 				else
 				{
 					logprintf("Teclado: desconectado");
-					g_kb_menu_open = false;
+					ctx_menu_close();
 					if(g_kb_map_target >= 0)
 						kb_map_close("sin dispositivo");
 					if(g_set_sel == SET_ROW_KEYBOARD)
@@ -5291,8 +5382,7 @@ int main(int argc, char **argv)
 					{
 						if(rising & VPAD_BUTTON_B)
 						{
-							g_qual_menu_open =
-								false;
+							ctx_menu_close();
 							logprintf(
 								"Calidad: menu cerrado");
 						}
@@ -5314,8 +5404,7 @@ int main(int argc, char **argv)
 					{
 						if(rising & VPAD_BUTTON_B)
 						{
-							g_mando_menu_open =
-								false;
+							ctx_menu_close();
 							logprintf(
 								"Modo: menu cerrado");
 						}
@@ -5344,7 +5433,7 @@ int main(int argc, char **argv)
 					{
 						if(rising & VPAD_BUTTON_B)
 						{
-							g_kb_menu_open = false;
+							ctx_menu_close();
 							logprintf("Teclado: menu cerrado");
 						}
 						else if(rising &
@@ -5564,7 +5653,7 @@ int main(int argc, char **argv)
 					}
 					else
 					{
-						g_qual_menu_open = false;
+						ctx_menu_close();
 						logprintf(
 							"Calidad: menu cerrado");
 					}
@@ -5591,7 +5680,7 @@ int main(int argc, char **argv)
 					}
 					else
 					{
-						g_mando_menu_open = false;
+						ctx_menu_close();
 						logprintf("Modo: menu cerrado");
 					}
 					g_set_drag_moved = true; // el toque lo consumio
@@ -5609,7 +5698,8 @@ int main(int argc, char **argv)
 			else if(touched && g_set_touch_prev)
 			{
 				// Mantenido: umbral de arrastre y seguimiento del dedo.
-				if(!g_qual_menu_open && !g_mando_menu_open)
+				if(!g_qual_menu_open && !g_mando_menu_open &&
+				   !g_kb_menu_open)
 				{
 					int dy = (int)tp.y - g_set_drag_y;
 					if(!g_set_drag_moved &&
@@ -6338,6 +6428,49 @@ int main(int argc, char **argv)
 			   !(g_av_disabled & CHIAKI_VIDEO_DISABLED))
 				wiiu_video_upload();
 
+			// Animacion de los menues contextuales (gui-106):
+			// detecta aperturas, remata cierres y fija escala/
+			// alfa para los pases TV y DRC de este frame.
+			{
+				uint64_t now = OSGetTime();
+				bool any = g_qual_menu_open ||
+					   g_mando_menu_open ||
+					   g_kb_menu_open;
+				if(any && !g_ctx_was_open)
+				{
+					g_ctx_out = false;
+					g_ctx_t0 = now;
+				}
+				g_ctx_was_open = any;
+				if(g_ctx_out &&
+				   now - g_ctx_t0 >= CTX_CLOSE_MS)
+				{
+					g_qual_menu_open = false;
+					g_mando_menu_open = false;
+					g_kb_menu_open = false;
+					g_ctx_out = false;
+					g_ctx_was_open = false;
+				}
+				float t = (float)(double)(now - g_ctx_t0) /
+					  (float)(g_ctx_out ? CTX_CLOSE_MS
+							    : CTX_OPEN_MS);
+				if(t > 1.f)
+					t = 1.f;
+				if(g_ctx_out)
+				{
+					g_ctx_a = 1.f - t;
+					g_ctx_k = 1.f;
+				}
+				else
+				{
+					// ease-out cubico: entra rapido y
+					// encaja suave contra el fondo.
+					float p = 1.f - (1.f - t) * (1.f - t) *
+							   (1.f - t);
+					g_ctx_a = p;
+					g_ctx_k = 0.92f + 0.08f * p;
+				}
+			}
 			WHBGfxBeginRender();
 
 			WHBGfxBeginRenderTV();
