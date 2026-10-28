@@ -3113,7 +3113,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-107b"
+#define APP_BUILD_TAG "gui-108"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -6893,8 +6893,13 @@ int main(int argc, char **argv)
 					g_ctx_t0 = now;
 				}
 				g_ctx_was_open = any;
+				// ticks -> ms (gui-108): sin OSMillisecondsToTicks los
+				// ticks crudos (62.5 por ms) daban t=1 en <1 frame y
+				// la animacion no se llegaba a ver.
+				float ms = (float)((double)(now - g_ctx_t0) /
+				                    OSMillisecondsToTicks(1));
 				if(g_ctx_out &&
-				   now - g_ctx_t0 >= CTX_CLOSE_MS)
+				   ms >= (float)CTX_CLOSE_MS)
 				{
 					g_qual_menu_open = false;
 					g_mando_menu_open = false;
@@ -6902,9 +6907,8 @@ int main(int argc, char **argv)
 					g_ctx_out = false;
 					g_ctx_was_open = false;
 				}
-				float t = (float)(double)(now - g_ctx_t0) /
-					  (float)(g_ctx_out ? CTX_CLOSE_MS
-							    : CTX_OPEN_MS);
+				float t = ms / (float)(g_ctx_out ? CTX_CLOSE_MS
+				                                     : CTX_OPEN_MS);
 				if(t > 1.f)
 					t = 1.f;
 				if(g_ctx_out)
