@@ -860,6 +860,24 @@ static void wiiu_chiaki_log_cb(ChiakiLogLevel level, const char *msg, void *user
 	logprintf("[chiaki:%c] %s", chiaki_log_level_char(level), msg);
 }
 
+// Nombre legible de un ChiakiTarget (la lib no expone ninguno): solo
+// para el log. gui-109: con una PS5 de firmware actual el target
+// resolvia PS4_9 y regist enviaba SRC2 (la PS5 lo ignoraba => timeout); el
+// log ahora lo dice explicito en discovery y en Registro iniciado.
+static const char *target_str(ChiakiTarget t)
+{
+	switch(t)
+	{
+		case CHIAKI_TARGET_PS4_UNKNOWN: return "PS4_UNKNOWN";
+		case CHIAKI_TARGET_PS4_8:       return "PS4_8";
+		case CHIAKI_TARGET_PS4_9:       return "PS4_9";
+		case CHIAKI_TARGET_PS4_10:      return "PS4_10";
+		case CHIAKI_TARGET_PS5_UNKNOWN: return "PS5_UNKNOWN";
+		case CHIAKI_TARGET_PS5_1:       return "PS5_1";
+		default:                        return "?";
+	}
+}
+
 // cb del ChiakiDiscoveryService: se invoca (en el thread del servicio) cada vez
 // que cambia la lista de consolas conocidas (alta, cambio de estado o drop).
 // Ademas de loguear, deja un snapshot de la consola usable por ↑/A.
@@ -870,12 +888,13 @@ static void discovery_state_cb(ChiakiDiscoveryHost *hosts, size_t hosts_count, v
 	for(size_t i = 0; i < hosts_count; i++)
 	{
 		ChiakiDiscoveryHost *host = hosts + i;
-		CHIAKI_LOGI(log, "  host[%u]: %s (%s) state=%s req_port=%u",
+		CHIAKI_LOGI(log, "  host[%u]: %s (%s) state=%s req_port=%u target=%s",
 			    (unsigned int)i,
 			    host->host_name ? host->host_name : "?",
 			    host->host_addr ? host->host_addr : "?",
 			    chiaki_discovery_host_state_string(host->state),
-			    (unsigned int)host->host_request_port);
+			    (unsigned int)host->host_request_port,
+			    target_str(chiaki_discovery_host_system_version_target(host)));
 		if(host->running_app_name && host->running_app_name[0])
 			CHIAKI_LOGI(log, "    running: %s (%s)", host->running_app_name,
 				    host->running_app_titleid ? host->running_app_titleid : "?");
@@ -1915,7 +1934,8 @@ static bool start_regist(uint32_t pin)
 		return false;
 	}
 	g_regist_state = RegistState::Running;
-	logprintf("Registro iniciado contra %s (PIN en la pantalla de la PS4)", regist_host);
+	logprintf("Registro iniciado contra %s (PIN en la pantalla de la "
+		  "consola, target=%s)", regist_host, target_str(target));
 	return true;
 }
 
@@ -3113,7 +3133,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-108"
+#define APP_BUILD_TAG "gui-109"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en

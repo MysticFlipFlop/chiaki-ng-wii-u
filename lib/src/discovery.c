@@ -45,12 +45,15 @@ CHIAKI_EXPORT ChiakiTarget chiaki_discovery_host_system_version_target(ChiakiDis
 	int version = atoi(host->system_version);
 	bool is_ps5 = chiaki_discovery_host_is_ps5(host);
 
-	if(version >= 8050001 && is_ps5)
-		// PS5 >= 1.0
+	// gui-109 (fix probado en vitaki-vitarps5): el target de una PS5
+	// NO depende de system_version. El firmware actual reporta
+	// "07200005" (atoi 7200005), por debajo de los umbrales antiguos
+	// 8050001/8050000, y el codigo caia a la rama PS4 => regist
+	// enviaba "SRC2" en vez de "SRC3" y la PS5 ignoraba el paquete
+	// de busqueda (timeout "waiting for search response"). El header
+	// device_discovery_protocol_version="00030010" ya la identifica.
+	if(is_ps5)
 		return CHIAKI_TARGET_PS5_1;
-	if(version >= 8050000 && is_ps5)
-		// PS5 >= 0
-		return CHIAKI_TARGET_PS5_UNKNOWN;
 
 	if(version >= 8000000)
 		// PS4 >= 8.0
