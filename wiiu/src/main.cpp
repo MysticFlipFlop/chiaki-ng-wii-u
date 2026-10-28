@@ -1228,10 +1228,12 @@ static void lang_load_active(void)
 	if(n <= 0)
 	{
 		logprintf("Idioma: no se pudo leer %s (%d)", path, n);
+		logq_drain_batch();
 		return;
 	}
 	lang_parse(g_lang_store);
 	logprintf("Idioma: %s cargado (%d entradas)", path, g_lang_ents_n);
+	logq_drain_batch();
 }
 
 // Escanea la app dir buscando *.pak y fija el idioma activo.
@@ -1269,6 +1271,8 @@ static void lang_init(const char *pref)
 		}
 		OSUnlockMutex(&g_log_mutex);
 	}
+	logprintf("Idioma: escaneo ok (%d pak(s))", g_lang_packs_n);
+	logq_drain_batch();
 
 	// Idioma activo: pref explicito, o auto (eng si hay eng.pak).
 	int target = 0;
@@ -1293,7 +1297,13 @@ static void lang_init(const char *pref)
 
 	// Nombre visible de cada pak (cabecera @lang= en su ventana).
 	char path[sizeof(LANG_SD_DIR) + 16];
-	char probe[LANG_PROBE + 1];
+	// Alineado a 64: FSReadFile de datos cruza a IOSU y FSA exige
+	// buffers de datos alineados en consola (en Cemu no se comprueba;
+	// misma regla que los buffers de ioctl en log_file_init). Sin
+	// esto la sonda congelaba el arranque solo con eng.pak
+	// (gui-107b): sin pak la sonda no se ejecuta y el fallo
+	// quedaba oculto.
+	char probe[LANG_PROBE + 1] __attribute__((aligned(64)));
 	for(int i = 0; i < g_lang_packs_n; i++)
 	{
 		snprintf(path, sizeof(path), "%s/%s.pak", LANG_SD_DIR,
@@ -1303,6 +1313,8 @@ static void lang_init(const char *pref)
 				(n > 0) ? (size_t)n : 0, g_lang_packs[i].name,
 				sizeof(g_lang_packs[i].name));
 	}
+	logprintf("Idioma: sonda de nombres ok");
+	logq_drain_batch();
 
 	g_lang_cur = target;
 	lang_load_active();
@@ -3101,7 +3113,7 @@ static void swkbd_shutdown()
 // columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
 // (apply_console vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-107"
+#define APP_BUILD_TAG "gui-107b"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
