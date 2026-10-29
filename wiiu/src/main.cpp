@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-113"
+#define APP_BUILD_TAG "gui-114"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4801,7 +4801,7 @@ static void draw_console_square(const MenuPal *p, int idx, float x, float y,
 		       &bu, &bv, &bw, &bh);
 	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_LIGHT : GUI_ASSET_PS4_LIGHT,
 		       &su, &sv, &sw, &sh);
-	float art_w = (float)(side - u * 4);
+	float art_w = (float)(side - side / 5);
 	float art_h = art_w * (ps5 ? (34.f / 128.f) : (22.f / 128.f));
 	float art_x = x + ((float)side - art_w) / 2.f;
 	float art_y = y + ((float)side - art_h) / 2.f;
@@ -4921,7 +4921,7 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 // Mini-tarjeta de una vecina (gui-111): solo fondo y arte, se mete
 // detras del cuadrado elegido y asoma por un lado (k tenue).
 static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
-			      int side, int u, float k, ChiakiTarget target)
+			      int side, float k, ChiakiTarget target)
 {
 	const ConfigConsole *con = &g_config.consoles[idx];
 
@@ -4933,7 +4933,7 @@ static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
 		       &bu, &bv, &bw, &bh);
 	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_LIGHT : GUI_ASSET_PS4_LIGHT,
 		       &su, &sv, &sw, &sh);
-	float art_w = (float)(side - u * 2);
+	float art_w = (float)(side - side / 4);
 	float art_h = art_w * (ps5 ? (34.f / 128.f) : (22.f / 128.f));
 	float art_x = x + ((float)side - art_w) / 2.f;
 	float art_y = y + ((float)side - art_h) / 2.f;
@@ -4941,6 +4941,88 @@ static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
 		  col_fade(p->icon, k));
 	gui_image(art_x, art_y, art_w, art_h, su, sv, sw, sh,
 		  col_fade(p->off, k));
+}
+
+// Fondo animado estilo olas del PS5 (gui-114, reproducido de
+// "assets wii u/waves.html"): cintas sinusoidales sutiles en el
+// tercio inferior + polvo estelar muy tenue. Se llama tras el rect de
+// fondo del menu/Ajustes, detras de todo el contenido; los alfas
+// bajos (<=13%) mantienen legible el texto encima. Cada cinta son
+// tiras verticales que siguen y = base + A1*sin(x*f + t*s) +
+// A2*cos(x*f*1.7 - t*s*0.8), como el drawSilkRibbon del HTML.
+#define WAVES_RIBBONS 3
+#define WAVES_PARTS 24
+static void draw_waves_bg(int w, int h)
+{
+	// Reloj compartido (ms) en la misma escala de "time += 0.006"
+	// por frame a 60 fps del original: 0.36 rad/s.
+	double sec = (double)(OSGetTime() / OSMillisecondsToTicks(1)) *
+		     0.001;
+	float t = (float)(sec * 0.36);
+
+	// Tiras por cinta: ~80 en TV y ~70 en DRC (poco coste y el
+	// alfa bajo oculta los escalones del muestreo).
+	int strip = (w >= 1280) ? 24 : 12;
+	static const float base_f[WAVES_RIBBONS] = { 0.62f, 0.70f,
+						    0.77f };
+	static const float amp_f[WAVES_RIBBONS] = { 0.090f, 0.070f,
+						    0.050f };
+	static const float frq_f[WAVES_RIBBONS] = { 2.1f, 3.3f,
+						    4.2f }; // rad/pantalla
+	static const float spd_f[WAVES_RIBBONS] = { 0.8f, 1.1f, 1.4f };
+	static const uint32_t col[WAVES_RIBBONS] = {
+		GUI_RGBA(212, 160, 23, 0x16), // dorado tenue
+		GUI_RGBA(135, 35, 215, 0x1a), // morado
+		GUI_RGBA(0x00, 0x84, 0xff, 0x22), // azul PS5
+	};
+	for(int k = 0; k < WAVES_RIBBONS; k++)
+	{
+		float yb = base_f[k] * (float)h;
+		float amp = amp_f[k] * (float)h;
+		float ph = frq_f[k] / (float)w;
+		float sp = spd_f[k];
+		for(int x = 0; x < w; x += strip)
+		{
+			float x1 = (float)(x + strip);
+			float y0 = yb +
+				   sinf((float)x * ph + t * sp) * amp +
+				   cosf((float)x * ph * 1.7f -
+					t * sp * 0.8f) *
+					   amp * 0.45f;
+			float y1 = yb + sinf(x1 * ph + t * sp) * amp +
+				   cosf(x1 * ph * 1.7f - t * sp * 0.8f) *
+					   amp * 0.45f;
+			// Tira desde el menor de los dos extremos: las
+			// tiras vecinas se solapan y no quedan huecos.
+			float ytop = y0 < y1 ? y0 : y1;
+			gui_rect((float)x, ytop, (float)strip + 1.f,
+				 (float)h - ytop, col[k]);
+		}
+	}
+
+	// Polvo estelar: puntos tenues que suben despacio con pulso;
+	// hash deterministico por particula (sin estado).
+	for(int i = 0; i < WAVES_PARTS; i++)
+	{
+		uint32_t hsh = (uint32_t)i * 2654435761u;
+		float sx = (float)(hsh & 0xffff) / 65536.f;
+		float sy = (float)((hsh >> 16) & 0xffff) / 65536.f;
+		float sp = 0.02f +
+			   (float)((hsh >> 8) & 0xff) / 255.f * 0.05f;
+		float y = fmodf(sy - (float)sec * sp, 1.f);
+		if(y < 0.f)
+			y += 1.f;
+		float x = sx * (float)w +
+			  sinf((float)sec * 0.3f + (float)i) *
+				  (float)w * 0.004f;
+		float a = 0.10f + 0.08f * sinf((float)sec * 1.7f +
+					      (float)i * 2.1f);
+		if(a < 0.03f)
+			a = 0.03f;
+		gui_rect(x, y * (float)h, 2.f, 2.f,
+			 GUI_RGBA(0xff, 0xff, 0xff,
+				  (uint8_t)(a * 255.f)));
+	}
 }
 
 static void draw_menu(int w, int h)
@@ -4977,6 +5059,7 @@ static void draw_menu(int w, int h)
 
 	// Fondo + ToolBar (chiaki-ng: barra de80/1080 con botones planos).
 	gui_rect(0.f, 0.f, (float)w, (float)h, c_bg);
+	draw_waves_bg(w, h); // olas del PS5 tras el fondo
 	int bar_h = u * 3 + u / 2;
 	gui_rect(0.f, 0.f, (float)w, (float)bar_h, c_bar);
 	// Divisor sutil bajo la barra (elevation de Material: 1dp).
@@ -5606,7 +5689,7 @@ static void draw_menu(int w, int h)
 	{
 		// Cuadrado + panel de detalle (gui-111): la consola
 		// elegida en un cuadrado bajo el logo (arte PS4/PS5 real,
-		// u*20 de lado) y su detalle a la derecha; las vecinas
+		// w/6 de lado) y su detalle a la derecha; las vecinas
 		// asoman por detras del cuadrado. Izq/Dcha lo desliza la
 		// distancia entre tarjetas (260 ms, ease-out) con fundido
 		// de la saliente. Cada tarjeta lee su estado del snapshot
@@ -5621,19 +5704,21 @@ static void draw_menu(int w, int h)
 		const MenuPal pal = { c_bg, c_sel, c_text, c_text2, c_text3,
 				      c_accent, c_standby, c_white, c_icon,
 				      c_off, c_chip };
-		int side = u * 20; // lado del cuadrado de portada
+		int side = w / 6; // lado del cuadrado (16,7%: la
+				// misma proporcion en TV y DRC)
 		float sq_x = (float)m; // arriba a la izquierda, bajo el logo
 		float sq_y = (float)list_y;
-		int peek_s = u * 8; // mini-tarjeta de la vecina
-		// La vecina se mete DETRAS del cuadrado y asoma u*4 a un
-		// lado (la de la derecha acaba justo donde empieza el
+		int peek_s = side * 2 / 5; // mini-tarjeta de la vecina
+		// La vecina se mete DETRAS del cuadrado y asoma side/5 a
+		// un lado (la de la derecha acaba justo donde empieza el
 		// panel); la izquierda asoma en el borde de la pantalla.
-		float pk_right = sq_x + (float)side - (float)(u * 4);
-		float pk_left = sq_x + (float)(u * 4) - (float)peek_s;
+		float pk_right = sq_x + (float)side - (float)(side / 5);
+		float pk_left = sq_x + (float)(side / 5) -
+				(float)peek_s;
 		float pk_y = sq_y + ((float)side - (float)peek_s) / 2.f;
-		int panel_x = m + side + u * 4 + u * 2;
+		int panel_x = m + side + side * 3 / 10;
 		int panel_w = w - panel_x - m;
-		float slide = (float)side + (float)(u * 6);
+		float slide = (float)(side * 13 / 10);
 		bool regist_now = g_regist_state != RegistState::Idle;
 
 		// Progreso del carrusel: ease-out 1-(1-t)^2 (gui-108).
@@ -5718,7 +5803,7 @@ static void draw_menu(int w, int h)
 					snaps, g_config.consoles[ni].host);
 				draw_console_peek(
 					&pal, ni, sp ? pk_right : pk_left,
-					pk_y, peek_s, u, 0.35f,
+					pk_y, peek_s, 0.35f,
 					(ns &&
 					 !chiaki_target_is_unknown(ns->target))
 						? ns->target
