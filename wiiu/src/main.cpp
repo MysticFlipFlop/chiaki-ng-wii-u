@@ -125,8 +125,8 @@ static volatile bool g_config_dirty = false;
 // Consola resaltada en el menu (indice en g_config.consoles); la
 // navegan Izq/Dcha y la aplica apply_console() a los globals de sesion.
 static int g_menu_sel = 0;
-// Animacion del carrusel de consolas (gui-110): al cambiar con
-// Izq/Dcha la tarjeta saliente se desliza al lado opuesto con
+// Animacion del carrusel de consolas (gui-110/111): al cambiar con
+// Izq/Dcha la saliente se desliza la distancia entre tarjetas con
 // fundido y la entrante entra desde el lado de la flecha.
 static uint64_t g_consanim_t0;
 static int g_consanim_dir;   // +1 = avance a la derecha
@@ -3313,13 +3313,14 @@ static void swkbd_shutdown()
 // Menu principal: se dibuja en TV y DRC cuando no hay sesion activa.
 // Replica el look de chiaki-ng (gui/src/qml/Main.qml): tema Qt Material
 // Dark (fondo #121212, ToolBar #1e1e1e, acento #00a7ff) con su ToolBar de
-// botones planos y un carrusel cover-flow de consolas (gui-110): la
-// elegida al centro en grande con su arte PS4/PS5 real (cuerpo + tira de
-// luz #light_on/#light_standby), nombre, IP, estado y juego en curso;
-// las demas asoman a los lados. Izq/Dcha la desliza (apply_console
+// botones planos y un carrusel de consolas (gui-111): la elegida en un
+// cuadrado bajo el logo con su arte PS4/PS5 real (cuerpo + tira de luz
+// #light_on/#light_standby) y su detalle (nombre, IP, estado, juego) en
+// el panel de la derecha; las vecinas asoman por detras del cuadrado.
+// Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-110"
+#define APP_BUILD_TAG "gui-111"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4780,29 +4781,19 @@ static const HostSnap *host_snap_of(const HostSnap *snaps, const char *host)
 	return nullptr;
 }
 
-// Tarjeta de una consola del carrusel (gui-110): arte real PS4/PS5 con
-// la tira de luz teñida por estado (#light_on/#light_standby del SVG),
-// nombre, IP, estado y juego en ejecucion; la activa lleva el chip A de
-// Conectar/Despertar. "k" atenúa todos los colores (vecinas y fundidos).
-static void draw_console_card(const MenuPal *p, int idx, float x, float y,
-			      int cw, int ch, int u, int scale, float k,
-			      bool sel_card, bool regist_now, bool seen,
-			      ChiakiDiscoveryHostState state, const char *game,
-			      ChiakiTarget target)
+// Cuadrado de portada de una consola del carrusel (gui-111): fondo
+// Material con filete de acento y el arte PS4/PS5 real centrado (cuerpo
+// + tira de luz teñida por estado #light_on/#light_standby del SVG).
+static void draw_console_square(const MenuPal *p, int idx, float x, float y,
+				int side, int u, float k, bool seen,
+				ChiakiDiscoveryHostState state,
+				ChiakiTarget target)
 {
 	const ConfigConsole *con = &g_config.consoles[idx];
 
-	// Fondo Material de la tarjeta + tinte de acento en la activa.
-	gui_rect(x, y, (float)cw, (float)ch, col_fade(p->bg, k));
-	if(sel_card)
-	{
-		gui_rect(x, y, (float)cw, (float)ch, col_fade(p->sel, k));
-		gui_rect(x, y, (float)cw, (float)(u / 3),
-			 col_fade(p->accent, k));
-	}
+	gui_rect(x, y, (float)side, (float)side, col_fade(p->bg, k));
+	gui_rect(x, y, (float)side, (float)(u / 3), col_fade(p->accent, k));
 
-	// Arte de la consola: PS5 si el tipo lo dice (config.ini o
-	// discovery), PS4 por defecto; la luz indica el estado.
 	bool ps5 = chiaki_target_is_ps5(target) ||
 		   con->type == CONFIG_CONSOLE_TYPE_PS5;
 	float bu, bv, bw, bh, su, sv, sw, sh;
@@ -4810,10 +4801,10 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 		       &bu, &bv, &bw, &bh);
 	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_LIGHT : GUI_ASSET_PS4_LIGHT,
 		       &su, &sv, &sw, &sh);
-	float art_w = (float)(u * 14);
+	float art_w = (float)(side - u * 4);
 	float art_h = art_w * (ps5 ? (34.f / 128.f) : (22.f / 128.f));
-	float art_x = x + ((float)cw - art_w) / 2.f;
-	float art_y = y + (float)(u * 3);
+	float art_x = x + ((float)side - art_w) / 2.f;
+	float art_y = y + ((float)side - art_h) / 2.f;
 	uint32_t light = col_fade(p->off, k);
 	if(seen)
 	{
@@ -4825,18 +4816,28 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 	gui_image(art_x, art_y, art_w, art_h, bu, bv, bw, bh,
 		  col_fade(p->icon, k));
 	gui_image(art_x, art_y, art_w, art_h, su, sv, sw, sh, light);
+}
+
+// Panel de detalle de la consola elegida (gui-111): nombre grande,
+// direccion, estado con color, juego en curso y el chip A de
+// Conectar/Despertar abajo, a la altura del pie del cuadrado ("side" es
+// su lado).
+static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
+			       int pw, int side, int u, int scale, float k,
+			       bool sel, bool regist_now, bool seen,
+			       ChiakiDiscoveryHostState state,
+			       const char *game)
+{
+	const ConfigConsole *con = &g_config.consoles[idx];
 
 	// Nombre (grande, acortado si no cabe) + direccion IP.
-	float tx = x + (float)(u * 3);
-	int name_scale = scale + 1;
-	int max_tw = cw - u * 6;
 	char nm[CONFIG_NAME_SIZE + 1];
 	snprintf(nm, sizeof(nm), "%s", con->name[0] ? con->name : "?");
-	while(nm[0] && gui_text_width(nm, name_scale) > max_tw)
+	int name_scale = scale + 2;
+	while(nm[0] && gui_text_width(nm, name_scale) > pw)
 		nm[strlen(nm) - 1] = '\0';
-	float ty = art_y + art_h + (float)(u * 3);
-	gui_text(tx, ty, nm, col_fade(p->text, k), name_scale);
-	gui_text(tx, ty + (float)(u * 3), con->host, col_fade(p->text2, k),
+	gui_text(x, y, nm, col_fade(p->text, k), name_scale);
+	gui_text(x, y + (float)(u * 3), con->host, col_fade(p->text2, k),
 		 scale);
 
 	// Estado con color + juego en ejecucion (solo el discovery en
@@ -4844,7 +4845,7 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 	// mostrar).
 	const char *state_txt;
 	uint32_t state_col;
-	if(regist_now && sel_card)
+	if(regist_now && sel)
 	{
 		state_txt = tr("Estado: registrando...");
 		state_col = p->standby;
@@ -4869,8 +4870,8 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 		state_txt = tr("Sin datos");
 		state_col = p->text3;
 	}
-	float sy = ty + (float)(u * 5);
-	gui_text(tx, sy, state_txt, col_fade(state_col, k), scale);
+	float sy = y + (float)(u * 6);
+	gui_text(x, sy, state_txt, col_fade(state_col, k), scale + 1);
 	if(seen && state == CHIAKI_DISCOVERY_HOST_STATE_READY)
 	{
 		char line[96];
@@ -4878,15 +4879,15 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 			snprintf(line, sizeof(line), tr("Juego: %s"), game);
 		else
 			snprintf(line, sizeof(line), "%s", tr("Sin juego"));
-		while(line[0] && gui_text_width(line, scale) > max_tw - u * 6)
+		while(line[0] && gui_text_width(line, scale) > pw)
 			line[strlen(line) - 1] = '\0';
-		gui_text(tx, sy + (float)(u * 2), line,
+		gui_text(x, sy + (float)(u * 3), line,
 			 col_fade(p->text2, k), scale);
 	}
 
-	// Accion de la tarjeta activa (chip A en color acento), como la
-	// columna de acciones de chiaki-ng abajo a la derecha.
-	if(sel_card)
+	// Accion de la consola (chip A en color acento) abajo a la
+	// izquierda del panel, a la altura del pie del cuadrado.
+	if(sel)
 	{
 		const char *act = (seen && state ==
 				   CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
@@ -4894,13 +4895,37 @@ static void draw_console_card(const MenuPal *p, int idx, float x, float y,
 					  : tr("Conectar");
 		float chip_d = (float)(scale * 12);
 		float chip_gap = (float)(scale * 6);
-		float ax = x + (float)cw - (float)(u * 3) - chip_d -
-			   chip_gap - gui_text_width(act, scale);
-		float ay = y + (float)ch - (float)(u * 4) - (float)scale * 4.f;
-		draw_button_chip(ax, ay - (chip_d - (float)u) / 2.f,
+		float ay = y + (float)side - (float)(u * 4) -
+			   (float)scale * 4.f;
+		draw_button_chip(x, ay - (chip_d - (float)u) / 2.f,
 				 scale, 'A', p->accent, p->white);
-		gui_text(ax + chip_d + chip_gap, ay, act, p->accent, scale);
+		gui_text(x + chip_d + chip_gap, ay, act, p->accent, scale);
 	}
+}
+
+// Mini-tarjeta de una vecina (gui-111): solo fondo y arte, se mete
+// detras del cuadrado elegido y asoma por un lado (k tenue).
+static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
+			      int side, int u, float k, ChiakiTarget target)
+{
+	const ConfigConsole *con = &g_config.consoles[idx];
+
+	gui_rect(x, y, (float)side, (float)side, col_fade(p->bg, k));
+	bool ps5 = chiaki_target_is_ps5(target) ||
+		   con->type == CONFIG_CONSOLE_TYPE_PS5;
+	float bu, bv, bw, bh, su, sv, sw, sh;
+	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_BODY : GUI_ASSET_PS4_BODY,
+		       &bu, &bv, &bw, &bh);
+	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_LIGHT : GUI_ASSET_PS4_LIGHT,
+		       &su, &sv, &sw, &sh);
+	float art_w = (float)(side - u * 2);
+	float art_h = art_w * (ps5 ? (34.f / 128.f) : (22.f / 128.f));
+	float art_x = x + ((float)side - art_w) / 2.f;
+	float art_y = y + ((float)side - art_h) / 2.f;
+	gui_image(art_x, art_y, art_w, art_h, bu, bv, bw, bh,
+		  col_fade(p->icon, k));
+	gui_image(art_x, art_y, art_w, art_h, su, sv, sw, sh,
+		  col_fade(p->off, k));
 }
 
 static void draw_menu(int w, int h)
@@ -5564,13 +5589,14 @@ static void draw_menu(int w, int h)
 	}
 	else
 	{
-		// Carrusel cover-flow de consolas (gui-110): la elegida al
-		// centro en grande con su arte PS4/PS5 real (cuerpo + tira
-		// de luz teñida por estado); las vecinas asoman recortadas
-		// a los lados. Izq/Dcha lo desliza (260 ms, ease-out) con
-		// fundido de la saliente. Cada tarjeta lee su estado del
-		// snapshot por IP: en broadcast (Y) se refrescan todas; con
-		// IP dirigida solo contesta la elegida (Cemu ignora el
+		// Cuadrado + panel de detalle (gui-111): la consola
+		// elegida en un cuadrado bajo el logo (arte PS4/PS5 real,
+		// u*20 de lado) y su detalle a la derecha; las vecinas
+		// asoman por detras del cuadrado. Izq/Dcha lo desliza la
+		// distancia entre tarjetas (260 ms, ease-out) con fundido
+		// de la saliente. Cada tarjeta lee su estado del snapshot
+		// por IP: en broadcast (Y) se refrescan todas; con IP
+		// dirigida solo contesta la elegida (Cemu ignora el
 		// broadcast, por eso Izq/Dcha no lo usa).
 		HostSnap snaps[HOST_SNAP_MAX];
 		chiaki_mutex_lock(&g_host_mutex);
@@ -5580,13 +5606,19 @@ static void draw_menu(int w, int h)
 		const MenuPal pal = { c_bg, c_sel, c_text, c_text2, c_text3,
 				      c_accent, c_standby, c_white, c_icon,
 				      c_off, c_chip };
-		int card_w = w * 68 / 100;
-		int card_h = h - list_y - u * 8;
-		if(card_h < u * 12)
-			card_h = u * 12;
-		float card_x = ((float)w - (float)card_w) / 2.f;
-		float card_y = (float)list_y;
-		int card_gap = u * 3;
+		int side = u * 20; // lado del cuadrado de portada
+		float sq_x = (float)m; // arriba a la izquierda, bajo el logo
+		float sq_y = (float)list_y;
+		int peek_s = u * 8; // mini-tarjeta de la vecina
+		// La vecina se mete DETRAS del cuadrado y asoma u*4 a un
+		// lado (la de la derecha acaba justo donde empieza el
+		// panel); la izquierda asoma en el borde de la pantalla.
+		float pk_right = sq_x + (float)side - (float)(u * 4);
+		float pk_left = sq_x + (float)(u * 4) - (float)peek_s;
+		float pk_y = sq_y + ((float)side - (float)peek_s) / 2.f;
+		int panel_x = m + side + u * 4 + u * 2;
+		int panel_w = w - panel_x - m;
+		float slide = (float)side + (float)(u * 6);
 		bool regist_now = g_regist_state != RegistState::Idle;
 
 		// Progreso del carrusel: ease-out 1-(1-t)^2 (gui-108).
@@ -5625,79 +5657,85 @@ static void draw_menu(int w, int h)
 					snaps, g_config.consoles[from].host);
 				bool f_seen = fs && fs->state !=
 						      CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
-				draw_console_card(&pal, from,
-						  card_x - (float)g_consanim_dir *
-							  (float)w * e,
-						  card_y, card_w, card_h, u,
-						  scale, 1.f - e, false,
-						  regist_now, f_seen,
-						  fs ? fs->state
-						     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
-						  fs ? fs->game : "",
-						  fs ? fs->target
-						     : CHIAKI_TARGET_PS4_UNKNOWN);
+				float off =
+					-(float)g_consanim_dir * slide * e;
+				draw_console_square(
+					&pal, from, sq_x + off, sq_y, side, u,
+					1.f - e, f_seen,
+					fs ? fs->state
+					   : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					fs ? fs->target
+					   : CHIAKI_TARGET_PS4_UNKNOWN);
+				draw_console_panel(
+					&pal, from, (float)panel_x + off, sq_y,
+					panel_w, side, u, scale, 1.f - e,
+					false, regist_now, f_seen,
+					fs ? fs->state
+					   : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					fs ? fs->game : "");
 			}
-			draw_console_card(&pal, sel,
-					  card_x + (float)g_consanim_dir *
-						  (1.f - e) * (float)w,
-					  card_y, card_w, card_h, u, scale, e,
-					  true, regist_now, s_seen,
-					  ss ? ss->state
-					     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
-					  ss ? ss->game : "",
-					  ss ? ss->target
-					     : CHIAKI_TARGET_PS4_UNKNOWN);
+			float off = (float)g_consanim_dir * slide * (1.f - e);
+			draw_console_square(&pal, sel, sq_x + off, sq_y, side,
+					    u, e, s_seen,
+					    ss ? ss->state
+					       : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					    ss ? ss->target
+					       : CHIAKI_TARGET_PS4_UNKNOWN);
+			draw_console_panel(&pal, sel, (float)panel_x + off,
+					   sq_y, panel_w, side, u, scale, e,
+					   true, regist_now, s_seen,
+					   ss ? ss->state
+					      : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					   ss ? ss->game : "");
 		}
 		else
 		{
-			// Reposo: vecinas asomando a los lados (tenue, solo
-			// su borde visible tras el margen) y la elegida al
-			// centro en color pleno.
+			// Reposo: vecinas por detras del cuadrado (tenues,
+			// solo asoman u*4) y encima el cuadrado + panel de
+			// la elegida, en color pleno.
 			const int nbr[2] = { sel - 1, sel + 1 };
-			for(int s = 0; s < 2; s++)
+			for(int sp = 0; sp < 2; sp++)
 			{
-				int ni = nbr[s];
+				int ni = nbr[sp];
 				if(ni < 0 || ni >= count)
 					continue;
 				const HostSnap *ns = host_snap_of(
 					snaps, g_config.consoles[ni].host);
-				bool n_seen = ns && ns->state !=
-						      CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
-				draw_console_card(&pal, ni,
-						  card_x + (s ? 1.f : -1.f) *
-							  ((float)card_w +
-							   (float)card_gap),
-						  card_y, card_w, card_h, u,
-						  scale, 0.35f, false,
-						  regist_now, n_seen,
-						  ns ? ns->state
-						     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
-						  ns ? ns->game : "",
-						  ns ? ns->target
-						     : CHIAKI_TARGET_PS4_UNKNOWN);
+				draw_console_peek(
+					&pal, ni, sp ? pk_right : pk_left,
+					pk_y, peek_s, u, 0.35f,
+					(ns &&
+					 !chiaki_target_is_unknown(ns->target))
+						? ns->target
+						: CHIAKI_TARGET_PS4_UNKNOWN);
 			}
-			draw_console_card(&pal, sel, card_x, card_y, card_w,
-					  card_h, u, scale, 1.f, true,
-					  regist_now, s_seen,
-					  ss ? ss->state
-					     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
-					  ss ? ss->game : "",
-					  ss ? ss->target
-					     : CHIAKI_TARGET_PS4_UNKNOWN);
+			draw_console_square(&pal, sel, sq_x, sq_y, side, u,
+					    1.f, s_seen,
+					    ss ? ss->state
+					       : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					    ss ? ss->target
+					       : CHIAKI_TARGET_PS4_UNKNOWN);
+			draw_console_panel(&pal, sel, (float)panel_x, sq_y,
+					   panel_w, side, u, scale, 1.f, true,
+					   regist_now, s_seen,
+					   ss ? ss->state
+					      : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					   ss ? ss->game : "");
 		}
 
-		// Puntos indicadores centrados bajo la tarjeta.
+		// Puntos indicadores centrados bajo el cuadrado.
 		float dot_d = (float)u;
 		float dot_step = (float)(u * 2);
-		float dots_x = ((float)w -
-				 ((float)(count - 1) * dot_step + dot_d)) /
-			       2.f;
-		float dots_y = card_y + (float)card_h + (float)(u * 2);
+		float dots_x = sq_x +
+			       ((float)side -
+				((float)(count - 1) * dot_step + dot_d)) /
+				       2.f;
+		float dots_y = sq_y + (float)side + (float)(u * 2);
 		for(int i = 0; i < count; i++)
 			gui_rect(dots_x + (float)i * dot_step, dots_y, dot_d,
 				 dot_d, i == sel ? c_accent : c_text3);
 
-		// Contador "n/m" arriba a la derecha, junto a la tarjeta.
+		// Contador "n/m" arriba a la derecha, junto al panel.
 		char pos[16];
 		snprintf(pos, sizeof(pos), "%d/%d", sel + 1, count);
 		gui_text((float)(w - m) - gui_text_width(pos, scale),
