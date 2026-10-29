@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-115"
+#define APP_BUILD_TAG "gui-116"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4948,16 +4948,15 @@ static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
 		  col_fade(p->off, k));
 }
 
-// Fondo animado estilo olas del PS5 (gui-115, reproducido de
-// "assets wii u/waves.html"): cintas sinusoidales sutiles en el
-// tercio inferior + polvo estelar muy tenue. Se llama tras el rect de
-// fondo del menu/Ajustes, detras de todo el contenido; los alfas
-// bajos (<=20%) mantienen legible el texto encima. Cada cinta es una
-// banda de grosor propio cuyo centro sigue y = base +
-// A1*sin(x*f + t*s) + A2*cos(x*f*1.7 - t*s*0.8), como el
-// drawSilkRibbon del HTML.
+// Fondo animado estilo olas del PS5 (gui-116, reproducido de
+// "assets wii u/waves.html"): cada cinta es una onda con relleno
+// hacia abajo que se desvanece en tono casi negro (el "campo de
+// seda" del drawSilkRibbon del HTML, que alla logra con un
+// degradado vertical), en el tercio inferior, + polvo estelar.
+// Los alfas bajos mantienen legible el texto encima. Onda:
+// y = base + A1*sin(x*f + t*s) + A2*cos(x*f*1.7 - t*s*0.8).
 #define WAVES_RIBBONS 3
-#define WAVES_PARTS 24
+#define WAVES_PARTS 60
 static void draw_waves_bg(int w, int h)
 {
 	// Reloj compartido (ms) en la misma escala de "time += 0.006"
@@ -4966,9 +4965,16 @@ static void draw_waves_bg(int w, int h)
 		     0.001;
 	float t = (float)(sec * 0.36);
 
-	// Tiras por cinta: ~100 en TV y ~85 en DRC (poco coste y el
-	// alfa bajo oculta los escalones del muestreo).
-	int strip = (w >= 1280) ? 18 : 10;
+	// Tres niveles por cinta: cresta fina sobre la linea (tiras
+	// de "strip"), medio que se desvanece (x2 de anchas) y
+	// fondo que baja hasta el pie de pantalla (x4); el degradado
+	// se encadena al ~55% y ~35% del alfa de la cresta. Los
+	// niveles se tocan sin solapes en X (paso = ancho de tira):
+	// el solape duplica el alfa y deja costuras verticales; los
+	// escalones entre tiras los tapa el nivel inferior.
+	static const int mul[3] = { 1, 2, 4 };
+	static const uint8_t af[3] = { 0xff, 0x55, 0x22 };
+	int strip = (w >= 1280) ? 24 : 12;
 	static const float base_f[WAVES_RIBBONS] = { 0.62f, 0.70f,
 						    0.77f };
 	static const float amp_f[WAVES_RIBBONS] = { 0.090f, 0.070f,
@@ -4976,50 +4982,61 @@ static void draw_waves_bg(int w, int h)
 	static const float frq_f[WAVES_RIBBONS] = { 2.1f, 3.3f,
 						    4.2f }; // rad/pantalla
 	static const float spd_f[WAVES_RIBBONS] = { 0.8f, 1.1f, 1.4f };
-	// Alphas algo por encima de gui-114 (0x16/0x1a/0x22): al ser
-	// banda fina en vez de relleno hasta abajo, se ve mucha
-	// menos masa de color por pantalla y las tres cintas tienen
-	// que distinguirse.
 	static const uint32_t col[WAVES_RIBBONS] = {
 		GUI_RGBA(212, 160, 23, 0x26), // dorado tenue
 		GUI_RGBA(135, 35, 215, 0x2a), // morado
 		GUI_RGBA(0x00, 0x84, 0xff, 0x33), // azul PS5
 	};
+	// Borde superior de cada nivel en pixeles, relativo a la
+	// linea de onda (el fondo llega hasta despues del pie).
+	static const float lvl[3] = { -0.25f, 0.45f, 1.6f };
 	for(int k = 0; k < WAVES_RIBBONS; k++)
 	{
 		float yb = base_f[k] * (float)h;
 		float amp = amp_f[k] * (float)h;
-		float th = amp * 0.9f; // grosor de la banda
 		float ph = frq_f[k] / (float)w;
 		float sp = spd_f[k];
-		for(int x = 0; x < w; x += strip)
+		for(int lv = 0; lv < 3; lv++)
 		{
-			float x1 = (float)(x + strip);
-			float y0 = yb +
-				   sinf((float)x * ph + t * sp) * amp +
-				   cosf((float)x * ph * 1.7f -
-					t * sp * 0.8f) *
-					   amp * 0.45f;
-			float y1 = yb + sinf(x1 * ph + t * sp) * amp +
-				   cosf(x1 * ph * 1.7f - t * sp * 0.8f) *
-					   amp * 0.45f;
-			// Banda fina en vez de relleno hasta abajo
-			// (en gui-114 la ultima cinta tapaba a las
-			// otras y solo se veian 2 franjas turbias):
-			// del menor extremo - mitad del grosor al
-			// mayor + mitad, con el paso EXACTO del ancho
-			// de tira (sin +1: el solape duplicaba el
-			// alfa y dejaba costuras verticales oscuras
-			// cada tira).
-			float top = (y0 < y1 ? y0 : y1) - th * 0.5f;
-			float bot = (y0 > y1 ? y0 : y1) + th * 0.5f;
-			gui_rect((float)x, top, (float)strip, bot - top,
-				 col[k]);
+			int st = strip * mul[lv];
+			uint32_t c = GUI_RGBA((col[k] >> 24) & 0xff,
+					      (col[k] >> 16) & 0xff,
+					      (col[k] >> 8) & 0xff,
+					      (uint8_t)((col[k] & 0xff) *
+							  af[lv] / 255));
+			float o0 = lvl[lv] * amp;
+			float o1 = (lv == 2) ? ((float)h + amp)
+					     : lvl[lv + 1] * amp;
+			for(int x = 0; x < w; x += st)
+			{
+				float x1 = (float)(x + st);
+				float y0 = yb +
+					   sinf((float)x * ph + t * sp) *
+						   amp +
+					   cosf((float)x * ph * 1.7f -
+						t * sp * 0.8f) *
+						   amp * 0.45f;
+				float y1 = yb +
+					   sinf(x1 * ph + t * sp) * amp +
+					   cosf(x1 * ph * 1.7f -
+						t * sp * 0.8f) *
+						   amp * 0.45f;
+				// Cada tira empieza en el MAYOR de los
+				// dos extremos (tiras vecinas sin
+				// solapes en X); el escalon lo tapa el
+				// nivel inferior, que arranca mas abajo
+				// y llega hasta el pie de pantalla.
+				float ya = (y0 > y1 ? y0 : y1) + o0;
+				gui_rect((float)x, ya, (float)st,
+					 o1 - o0, c);
+			}
 		}
 	}
 
-	// Polvo estelar: puntos tenues que suben despacio con pulso;
-	// hash deterministico por particula (sin estado).
+	// Polvo estelar (gui-116: 60 particulas de 3-4 px con alfas
+	// 6-28%; con 24 de 2 px al 18% no se veia ninguna); suben
+	// despacio con pulso; hash deterministico por particula.
+	int psz = (w >= 1280) ? 4 : 3;
 	for(int i = 0; i < WAVES_PARTS; i++)
 	{
 		uint32_t hsh = (uint32_t)i * 2654435761u;
@@ -5033,11 +5050,11 @@ static void draw_waves_bg(int w, int h)
 		float x = sx * (float)w +
 			  sinf((float)sec * 0.3f + (float)i) *
 				  (float)w * 0.004f;
-		float a = 0.10f + 0.08f * sinf((float)sec * 1.7f +
+		float a = 0.16f + 0.12f * sinf((float)sec * 1.7f +
 					      (float)i * 2.1f);
-		if(a < 0.03f)
-			a = 0.03f;
-		gui_rect(x, y * (float)h, 2.f, 2.f,
+		if(a < 0.06f)
+			a = 0.06f;
+		gui_rect(x, y * (float)h, (float)psz, (float)psz,
 			 GUI_RGBA(0xff, 0xff, 0xff,
 				  (uint8_t)(a * 255.f)));
 	}

@@ -94,7 +94,9 @@
 #define ASSET_TP_W 128
 #define ASSET_TP_H 64
 
-#define MAX_VERTS 4096 //1024 quads por frame (el menu usa ~500)
+#define MAX_VERTS 8192 //2048 quads por frame: menu ~500 + olas
+			// ~450 (relleno degradado, gui-116) + panel y
+			// chips; el techo subio con las olas.
 
 // Pool rotativo de buffers de vertices del GUI (gui-100). La
 // rotacion es POR FLUSH y no por frame: GX2 es asincrono y no
@@ -615,6 +617,19 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, float scale)
 	const float dx = 8.f * (float)scale;
 	const float du = 8.f / (float)FONT_TEX_W;       //8 px /256 texels
 	const float dv = 8.f / (float)FONT_TEX_H;       //8 px /136 texels
+	// Anti-bleed (gui-116): con LINEAR el fragmento del borde
+	// del glifo muestrea dentro de medio texel del limite de
+	// su celda y arrastra el texel contiguo de la celda vecina
+	// del atlas (lineas fantasma alrededor de las letras, el
+	// bug del nombre en gui-115). Se recortan (0.5 - 0.5/scale)
+	// texeles por lado ajustados por el propio muestreo: a
+	// escala entera el primer y el ultimo fragmento caen en
+	// centros de texel (nitido) y a escala fraccional (nombre
+	// de la DRC) el borde queda limpio con suavizado.
+	const float iu = du * (0.5f - 0.5f / scale) /
+			  (8.f - 1.f / scale);
+	const float iv = dv * (0.5f - 0.5f / scale) /
+			  (8.f - 1.f / scale);
 	float cx = x;
 	const uint8_t *p = (const uint8_t *)utf8;
 	while(*p)
@@ -637,9 +652,10 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, float scale)
 		// Fuente: U+0000-U+007F + U+00A0-U+00FF. El resto: '?'.
 		else if(cp > 0xFF || (cp >= 0x80 && cp < 0xA0))
 			cp = '?';
-		float u0 = (float)(cp & 15) * du;
-		float v0 = (float)(cp >> 4) * dv;
-		push_quad(cx, y, dx, dx, color, u0, v0, u0 + du, v0 + dv);
+		float u0 = (float)(cp & 15) * du + iu;
+		float v0 = (float)(cp >> 4) * dv + iv;
+		push_quad(cx, y, dx, dx, color, u0, v0,
+			  u0 + du - 2.f * iu, v0 + dv - 2.f * iv);
 		cx += dx;
 	}
 }
