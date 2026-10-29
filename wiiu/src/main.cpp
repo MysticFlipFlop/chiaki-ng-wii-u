@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-116"
+#define APP_BUILD_TAG "gui-117"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4948,118 +4948,6 @@ static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
 		  col_fade(p->off, k));
 }
 
-// Fondo animado estilo olas del PS5 (gui-116, reproducido de
-// "assets wii u/waves.html"): cada cinta es una onda con relleno
-// hacia abajo que se desvanece en tono casi negro (el "campo de
-// seda" del drawSilkRibbon del HTML, que alla logra con un
-// degradado vertical), en el tercio inferior, + polvo estelar.
-// Los alfas bajos mantienen legible el texto encima. Onda:
-// y = base + A1*sin(x*f + t*s) + A2*cos(x*f*1.7 - t*s*0.8).
-#define WAVES_RIBBONS 3
-#define WAVES_PARTS 60
-static void draw_waves_bg(int w, int h)
-{
-	// Reloj compartido (ms) en la misma escala de "time += 0.006"
-	// por frame a 60 fps del original: 0.36 rad/s.
-	double sec = (double)(OSGetTime() / OSMillisecondsToTicks(1)) *
-		     0.001;
-	float t = (float)(sec * 0.36);
-
-	// Tres niveles por cinta: cresta fina sobre la linea (tiras
-	// de "strip"), medio que se desvanece (x2 de anchas) y
-	// fondo que baja hasta el pie de pantalla (x4); el degradado
-	// se encadena al ~55% y ~35% del alfa de la cresta. Los
-	// niveles se tocan sin solapes en X (paso = ancho de tira):
-	// el solape duplica el alfa y deja costuras verticales; los
-	// escalones entre tiras los tapa el nivel inferior.
-	static const int mul[3] = { 1, 2, 4 };
-	static const uint8_t af[3] = { 0xff, 0x55, 0x22 };
-	int strip = (w >= 1280) ? 24 : 12;
-	static const float base_f[WAVES_RIBBONS] = { 0.62f, 0.70f,
-						    0.77f };
-	static const float amp_f[WAVES_RIBBONS] = { 0.090f, 0.070f,
-						    0.050f };
-	static const float frq_f[WAVES_RIBBONS] = { 2.1f, 3.3f,
-						    4.2f }; // rad/pantalla
-	static const float spd_f[WAVES_RIBBONS] = { 0.8f, 1.1f, 1.4f };
-	static const uint32_t col[WAVES_RIBBONS] = {
-		GUI_RGBA(212, 160, 23, 0x26), // dorado tenue
-		GUI_RGBA(135, 35, 215, 0x2a), // morado
-		GUI_RGBA(0x00, 0x84, 0xff, 0x33), // azul PS5
-	};
-	// Borde superior de cada nivel en pixeles, relativo a la
-	// linea de onda (el fondo llega hasta despues del pie).
-	static const float lvl[3] = { -0.25f, 0.45f, 1.6f };
-	for(int k = 0; k < WAVES_RIBBONS; k++)
-	{
-		float yb = base_f[k] * (float)h;
-		float amp = amp_f[k] * (float)h;
-		float ph = frq_f[k] / (float)w;
-		float sp = spd_f[k];
-		for(int lv = 0; lv < 3; lv++)
-		{
-			int st = strip * mul[lv];
-			uint32_t c = GUI_RGBA((col[k] >> 24) & 0xff,
-					      (col[k] >> 16) & 0xff,
-					      (col[k] >> 8) & 0xff,
-					      (uint8_t)((col[k] & 0xff) *
-							  af[lv] / 255));
-			float o0 = lvl[lv] * amp;
-			float o1 = (lv == 2) ? ((float)h + amp)
-					     : lvl[lv + 1] * amp;
-			for(int x = 0; x < w; x += st)
-			{
-				float x1 = (float)(x + st);
-				float y0 = yb +
-					   sinf((float)x * ph + t * sp) *
-						   amp +
-					   cosf((float)x * ph * 1.7f -
-						t * sp * 0.8f) *
-						   amp * 0.45f;
-				float y1 = yb +
-					   sinf(x1 * ph + t * sp) * amp +
-					   cosf(x1 * ph * 1.7f -
-						t * sp * 0.8f) *
-						   amp * 0.45f;
-				// Cada tira empieza en el MAYOR de los
-				// dos extremos (tiras vecinas sin
-				// solapes en X); el escalon lo tapa el
-				// nivel inferior, que arranca mas abajo
-				// y llega hasta el pie de pantalla.
-				float ya = (y0 > y1 ? y0 : y1) + o0;
-				gui_rect((float)x, ya, (float)st,
-					 o1 - o0, c);
-			}
-		}
-	}
-
-	// Polvo estelar (gui-116: 60 particulas de 3-4 px con alfas
-	// 6-28%; con 24 de 2 px al 18% no se veia ninguna); suben
-	// despacio con pulso; hash deterministico por particula.
-	int psz = (w >= 1280) ? 4 : 3;
-	for(int i = 0; i < WAVES_PARTS; i++)
-	{
-		uint32_t hsh = (uint32_t)i * 2654435761u;
-		float sx = (float)(hsh & 0xffff) / 65536.f;
-		float sy = (float)((hsh >> 16) & 0xffff) / 65536.f;
-		float sp = 0.02f +
-			   (float)((hsh >> 8) & 0xff) / 255.f * 0.05f;
-		float y = fmodf(sy - (float)sec * sp, 1.f);
-		if(y < 0.f)
-			y += 1.f;
-		float x = sx * (float)w +
-			  sinf((float)sec * 0.3f + (float)i) *
-				  (float)w * 0.004f;
-		float a = 0.16f + 0.12f * sinf((float)sec * 1.7f +
-					      (float)i * 2.1f);
-		if(a < 0.06f)
-			a = 0.06f;
-		gui_rect(x, y * (float)h, (float)psz, (float)psz,
-			 GUI_RGBA(0xff, 0xff, 0xff,
-				  (uint8_t)(a * 255.f)));
-	}
-}
-
 static void draw_menu(int w, int h)
 {
 	// Escala2x en TV (>=1280) y1x en DRC: la fuente8x8 queda legible
@@ -5094,7 +4982,6 @@ static void draw_menu(int w, int h)
 
 	// Fondo + ToolBar (chiaki-ng: barra de80/1080 con botones planos).
 	gui_rect(0.f, 0.f, (float)w, (float)h, c_bg);
-	draw_waves_bg(w, h); // olas del PS5 tras el fondo
 	int bar_h = u * 3 + u / 2;
 	gui_rect(0.f, 0.f, (float)w, (float)bar_h, c_bar);
 	// Divisor sutil bajo la barra (elevation de Material: 1dp).

@@ -52,6 +52,8 @@
 #include <malloc.h>
 #include <string.h>
 
+#include <math.h> // ceilf (gui-117: glifo a escala fraccional)
+
 #define FONT_TEX_W 256 // mitad izq: glifos; mitad der: assets
 #define FONT_TEX_H 512 // glifos (128) + blanco (8) + assets PS5 hasta 325
 #define FONT_WHITE_ROW 128 // filas de bloque blanco para solidos
@@ -94,9 +96,7 @@
 #define ASSET_TP_W 128
 #define ASSET_TP_H 64
 
-#define MAX_VERTS 8192 //2048 quads por frame: menu ~500 + olas
-			// ~450 (relleno degradado, gui-116) + panel y
-			// chips; el techo subio con las olas.
+#define MAX_VERTS 4096 //1024 quads por frame (el menu usa ~500)
 
 // Pool rotativo de buffers de vertices del GUI (gui-100). La
 // rotacion es POR FLUSH y no por frame: GX2 es asincrono y no
@@ -617,19 +617,28 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, float scale)
 	const float dx = 8.f * (float)scale;
 	const float du = 8.f / (float)FONT_TEX_W;       //8 px /256 texels
 	const float dv = 8.f / (float)FONT_TEX_H;       //8 px /136 texels
-	// Anti-bleed (gui-116): con LINEAR el fragmento del borde
+	// Anti-bleed (gui-117): con LINEAR el fragmento del borde
 	// del glifo muestrea dentro de medio texel del limite de
 	// su celda y arrastra el texel contiguo de la celda vecina
-	// del atlas (lineas fantasma alrededor de las letras, el
-	// bug del nombre en gui-115). Se recortan (0.5 - 0.5/scale)
-	// texeles por lado ajustados por el propio muestreo: a
-	// escala entera el primer y el ultimo fragmento caen en
-	// centros de texel (nitido) y a escala fraccional (nombre
-	// de la DRC) el borde queda limpio con suavizado.
-	const float iu = du * (0.5f - 0.5f / scale) /
-			  (8.f - 1.f / scale);
-	const float iv = dv * (0.5f - 0.5f / scale) /
-			  (8.f - 1.f / scale);
+	// del atlas (lineas fantasma alrededor de las letras). El
+	// quad mide 8*scale px; si scale es fraccional, la ultima
+	// columna de pixel queda PARCIAL y su centro cae mas alla
+	// del centro del ultimo texel (gui-116 solo cubria el
+	// primero y el ultimo pixel entero: por eso el nombre de
+	// la DRC seguia con lineas). Solucion exacta: E =
+	// ceil(8*scale) columnas cubiertas, a = 7/(E-1) texeles
+	// por px y inset i = (E-8)/(2*(E-1)) dejan el primer y el
+	// ultimo fragmento EXACTAMENTE en centros de texel. A
+	// escala entera E=8*scale y queda a=1, i=0 (identico al
+	// muestreo original, pixel-perfect).
+	const float W = 8.f * scale; // ancho del glifo en px
+	const float E = ceilf(W); // columnas de pixel cubiertas
+	const float a = 7.f / (E - 1.f); // texeles por px
+	const float iu = du * ((E - 8.f) / (2.f * (E - 1.f))) /
+			  8.f;
+	const float iv = dv * ((E - 8.f) / (2.f * (E - 1.f))) /
+			  8.f;
+	const float su = a * W / 8.f; // span UV (unidades de du)
 	float cx = x;
 	const uint8_t *p = (const uint8_t *)utf8;
 	while(*p)
@@ -654,8 +663,8 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, float scale)
 			cp = '?';
 		float u0 = (float)(cp & 15) * du + iu;
 		float v0 = (float)(cp >> 4) * dv + iv;
-		push_quad(cx, y, dx, dx, color, u0, v0,
-			  u0 + du - 2.f * iu, v0 + dv - 2.f * iv);
+		push_quad(cx, y, dx, dx, color, u0, v0, u0 + du * su,
+			  v0 + dv * su);
 		cx += dx;
 	}
 }
