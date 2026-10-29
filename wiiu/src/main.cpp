@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-117"
+#define APP_BUILD_TAG "gui-118"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4915,7 +4915,15 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 					  : tr("Conectar");
 		float chip_d = (float)(scale * 12);
 		float chip_gap = (float)(scale * 6);
-		float ay = y + (float)side - (float)(u * 4) -
+		// gui-118: el chip baja de u*4 a u*2 sobre el pie
+		// del cuadrado. La IP quedaba a 8 px del circulo A
+		// en TV y a 1 px en la DRC (el bloque de texto casi
+		// no tiene margen abajo tras el centrado de
+		// gui-113 y no puede subir mas: en la DRC solo quedan
+		// 7 px arriba). Hueco IP->circulo: 40 px en TV (3.7%
+		// de la altura) y 17 px en DRC (3.5%): proporcional
+		// en las dos salidas.
+		float ay = y + (float)side - (float)(u * 2) -
 			   (float)scale * 4.f;
 		draw_button_chip(x, ay - (chip_d - (float)u) / 2.f,
 				 scale, 'A', p->accent, p->white);
