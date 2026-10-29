@@ -31,8 +31,8 @@ bool gui_init(void);
 
 void gui_begin(int viewport_w, int viewport_h);
 void gui_rect(float x, float y, float w, float h, uint32_t color);
-void gui_text(float x, float y, const char *utf8, uint32_t color, int scale);
-float gui_text_width(const char *utf8, int scale);
+void gui_text(float x, float y, const char *utf8, uint32_t color, float scale);
+float gui_text_width(const char *utf8, float scale);
 
 // Imagen: mask R8 del atlas (rect de pantalla + rect UV normalizado).
 // El tinte va por color de vertice; la mask decide la opacidad.

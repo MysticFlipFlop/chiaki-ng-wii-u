@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-114"
+#define APP_BUILD_TAG "gui-115"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4822,33 +4822,38 @@ static void draw_console_square(const MenuPal *p, int idx, float x, float y,
 // con color, juego en curso, la direccion IP al final en gris y el
 // chip A de Conectar/Despertar abajo, a la altura del pie del
 // cuadrado ("side" es su lado). El nombre va al mismo tamano que el
-// estado, con u*4 de ritmo entre lineas, y el bloque de texto se
-// centra verticalmente en el hueco sobre el chip (antes arrancaba
-// pegado al borde superior del cuadrado).
+// estado, y el bloque de texto se centra verticalmente en el hueco
+// sobre el chip. gui-115: nombre/estado y ritmo escalan con la
+// ALTURA para igualar la proporcion de la TV en la DRC (24 px
+// sobre 1080 en TV, 10.7 px sobre 480 en DRC).
 static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
-			       int pw, int side, int u, int scale, float k,
+			       int pw, int side, int u, int scale, int h,
+			       float k,
 			       bool sel, bool regist_now, bool seen,
 			       ChiakiDiscoveryHostState state,
 			       const char *game)
 {
 	const ConfigConsole *con = &g_config.consoles[idx];
 
-	// Bloque de texto centrado verticalmente en el cuadrado
-	// (gui-113): son 4 lineas (nombre, estado, juego, IP) con
-	// u*10 de alto mas la ultima linea; se centra en el hueco
-	// que queda por encima del chip A, como el raster.
+	// Bloque centrado verticalmente (gui-115): nombre y estado
+	// escalan con la ALTURA para mantener la proporcion de la
+	// TV (3x sobre 1080 = 24 px en TV, 10.7 px en DRC; el
+	// sampler LINEAR de gui.cpp suaviza la escala fraccional)
+	// y el ritmo de lineas tambien (los 64 px = u*4 de TV,
+	// 5.9% de la altura). Juego e IP se quedan en el minimo
+	// legible (8 px en DRC), ya validado en hardware.
+	float hr = (float)h / 1080.f;
+	float ts = 3.f * hr; // escala de nombre/estado
+	float ly = 64.f * hr; // ritmo entre lineas (u*4 en TV)
 	float ty = y + ((float)side - (float)(u * 4) -
-			(float)(u * 10 + scale * 8)) / 2.f;
+			(3.f * ly + ts * 8.f)) / 2.f;
 
-	// Nombre (acortado si no cabe), al mismo tamano que el
-	// estado (gui-112): antes era un paso mas grande y la IP
-	// quedaba pegada arriba.
+	// Nombre (acortado si no cabe).
 	char nm[CONFIG_NAME_SIZE + 1];
 	snprintf(nm, sizeof(nm), "%s", con->name[0] ? con->name : "?");
-	int name_scale = scale + 1;
-	while(nm[0] && gui_text_width(nm, name_scale) > pw)
+	while(nm[0] && gui_text_width(nm, ts) > pw)
 		nm[strlen(nm) - 1] = '\0';
-	gui_text(x, ty, nm, col_fade(p->text, k), name_scale);
+	gui_text(x, ty, nm, col_fade(p->text, k), ts);
 
 	// Estado con color + juego en ejecucion (solo el discovery en
 	// READY trae running_app_name; el resto no tiene juego que
@@ -4880,12 +4885,12 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 		state_txt = tr("Sin datos");
 		state_col = p->text3;
 	}
-	float sy = ty + (float)(u * 4);
-	gui_text(x, sy, state_txt, col_fade(state_col, k), scale + 1);
+	float sy = ty + ly;
+	gui_text(x, sy, state_txt, col_fade(state_col, k), ts);
 	// Juego en curso (si la consola esta lista) y la IP
-	// debajo, en gris; con u*4 de ritmo y la IP siempre
-	// despues de la ultima linea visible.
-	float iy = sy + (float)(u * 3);
+	// debajo, en gris; la IP siempre despues de la ultima
+	// linea visible.
+	float iy = sy + ly;
 	if(seen && state == CHIAKI_DISCOVERY_HOST_STATE_READY)
 	{
 		char line[96];
@@ -4896,7 +4901,7 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 		while(line[0] && gui_text_width(line, scale) > pw)
 			line[strlen(line) - 1] = '\0';
 		gui_text(x, iy, line, col_fade(p->text2, k), scale);
-		iy += (float)(u * 3);
+		iy += ly;
 	}
 	gui_text(x, iy, con->host, col_fade(p->text3, k), scale);
 
@@ -4943,13 +4948,14 @@ static void draw_console_peek(const MenuPal *p, int idx, float x, float y,
 		  col_fade(p->off, k));
 }
 
-// Fondo animado estilo olas del PS5 (gui-114, reproducido de
+// Fondo animado estilo olas del PS5 (gui-115, reproducido de
 // "assets wii u/waves.html"): cintas sinusoidales sutiles en el
 // tercio inferior + polvo estelar muy tenue. Se llama tras el rect de
 // fondo del menu/Ajustes, detras de todo el contenido; los alfas
-// bajos (<=13%) mantienen legible el texto encima. Cada cinta son
-// tiras verticales que siguen y = base + A1*sin(x*f + t*s) +
-// A2*cos(x*f*1.7 - t*s*0.8), como el drawSilkRibbon del HTML.
+// bajos (<=20%) mantienen legible el texto encima. Cada cinta es una
+// banda de grosor propio cuyo centro sigue y = base +
+// A1*sin(x*f + t*s) + A2*cos(x*f*1.7 - t*s*0.8), como el
+// drawSilkRibbon del HTML.
 #define WAVES_RIBBONS 3
 #define WAVES_PARTS 24
 static void draw_waves_bg(int w, int h)
@@ -4960,9 +4966,9 @@ static void draw_waves_bg(int w, int h)
 		     0.001;
 	float t = (float)(sec * 0.36);
 
-	// Tiras por cinta: ~80 en TV y ~70 en DRC (poco coste y el
+	// Tiras por cinta: ~100 en TV y ~85 en DRC (poco coste y el
 	// alfa bajo oculta los escalones del muestreo).
-	int strip = (w >= 1280) ? 24 : 12;
+	int strip = (w >= 1280) ? 18 : 10;
 	static const float base_f[WAVES_RIBBONS] = { 0.62f, 0.70f,
 						    0.77f };
 	static const float amp_f[WAVES_RIBBONS] = { 0.090f, 0.070f,
@@ -4970,15 +4976,20 @@ static void draw_waves_bg(int w, int h)
 	static const float frq_f[WAVES_RIBBONS] = { 2.1f, 3.3f,
 						    4.2f }; // rad/pantalla
 	static const float spd_f[WAVES_RIBBONS] = { 0.8f, 1.1f, 1.4f };
+	// Alphas algo por encima de gui-114 (0x16/0x1a/0x22): al ser
+	// banda fina en vez de relleno hasta abajo, se ve mucha
+	// menos masa de color por pantalla y las tres cintas tienen
+	// que distinguirse.
 	static const uint32_t col[WAVES_RIBBONS] = {
-		GUI_RGBA(212, 160, 23, 0x16), // dorado tenue
-		GUI_RGBA(135, 35, 215, 0x1a), // morado
-		GUI_RGBA(0x00, 0x84, 0xff, 0x22), // azul PS5
+		GUI_RGBA(212, 160, 23, 0x26), // dorado tenue
+		GUI_RGBA(135, 35, 215, 0x2a), // morado
+		GUI_RGBA(0x00, 0x84, 0xff, 0x33), // azul PS5
 	};
 	for(int k = 0; k < WAVES_RIBBONS; k++)
 	{
 		float yb = base_f[k] * (float)h;
 		float amp = amp_f[k] * (float)h;
+		float th = amp * 0.9f; // grosor de la banda
 		float ph = frq_f[k] / (float)w;
 		float sp = spd_f[k];
 		for(int x = 0; x < w; x += strip)
@@ -4992,11 +5003,18 @@ static void draw_waves_bg(int w, int h)
 			float y1 = yb + sinf(x1 * ph + t * sp) * amp +
 				   cosf(x1 * ph * 1.7f - t * sp * 0.8f) *
 					   amp * 0.45f;
-			// Tira desde el menor de los dos extremos: las
-			// tiras vecinas se solapan y no quedan huecos.
-			float ytop = y0 < y1 ? y0 : y1;
-			gui_rect((float)x, ytop, (float)strip + 1.f,
-				 (float)h - ytop, col[k]);
+			// Banda fina en vez de relleno hasta abajo
+			// (en gui-114 la ultima cinta tapaba a las
+			// otras y solo se veian 2 franjas turbias):
+			// del menor extremo - mitad del grosor al
+			// mayor + mitad, con el paso EXACTO del ancho
+			// de tira (sin +1: el solape duplicaba el
+			// alfa y dejaba costuras verticales oscuras
+			// cada tira).
+			float top = (y0 < y1 ? y0 : y1) - th * 0.5f;
+			float bot = (y0 > y1 ? y0 : y1) + th * 0.5f;
+			gui_rect((float)x, top, (float)strip, bot - top,
+				 col[k]);
 		}
 	}
 
@@ -5768,7 +5786,7 @@ static void draw_menu(int w, int h)
 					   : CHIAKI_TARGET_PS4_UNKNOWN);
 				draw_console_panel(
 					&pal, from, (float)panel_x + off, sq_y,
-					panel_w, side, u, scale, 1.f - e,
+					panel_w, side, u, scale, h, 1.f - e,
 					false, regist_now, f_seen,
 					fs ? fs->state
 					   : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
@@ -5782,7 +5800,7 @@ static void draw_menu(int w, int h)
 					    ss ? ss->target
 					       : CHIAKI_TARGET_PS4_UNKNOWN);
 			draw_console_panel(&pal, sel, (float)panel_x + off,
-					   sq_y, panel_w, side, u, scale, e,
+					   sq_y, panel_w, side, u, scale, h, e,
 					   true, regist_now, s_seen,
 					   ss ? ss->state
 					      : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
@@ -5816,7 +5834,7 @@ static void draw_menu(int w, int h)
 					    ss ? ss->target
 					       : CHIAKI_TARGET_PS4_UNKNOWN);
 			draw_console_panel(&pal, sel, (float)panel_x, sq_y,
-					   panel_w, side, u, scale, 1.f, true,
+					   panel_w, side, u, scale, h, 1.f, true,
 					   regist_now, s_seen,
 					   ss ? ss->state
 					      : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,

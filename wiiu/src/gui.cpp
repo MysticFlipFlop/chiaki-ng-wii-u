@@ -440,9 +440,13 @@ bool gui_init(void)
 			     GX2_TESSELLATION_MODE_DISCRETE);
 	GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, s_fetch_prog, fetch_size);
 
-	// POINT: fuente pixel-perfect (sin suavizado); CLAMP por seguridad.
+	// LINEAR (gui-115): el panel de la DRC usa escala fraccional
+	// (~1.33 = 10.7 px) para igualar la proporcion de la TV y con
+	// POINT se veia escalonada. A escalas enteras (1x/2x/3x) los
+	// bordes de quad caen en centros de texel y sigue quedando
+	// pixel-perfect; CLAMP por seguridad.
 	GX2InitSampler(&s_samp, GX2_TEX_CLAMP_MODE_CLAMP,
-		       GX2_TEX_XY_FILTER_MODE_POINT);
+		       GX2_TEX_XY_FILTER_MODE_LINEAR);
 
 	if(!font_create())
 		return false;
@@ -602,7 +606,7 @@ static const uint8_t *next_cp(const uint8_t *p, uint32_t *cp)
 	return p + 1;
 }
 
-void gui_text(float x, float y, const char *utf8, uint32_t color, int scale)
+void gui_text(float x, float y, const char *utf8, uint32_t color, float scale)
 {
 	if(!s_in_begin)
 		return;
@@ -640,7 +644,7 @@ void gui_text(float x, float y, const char *utf8, uint32_t color, int scale)
 	}
 }
 
-float gui_text_width(const char *utf8, int scale)
+float gui_text_width(const char *utf8, float scale)
 {
 	if(scale < 1)
 		scale = 1;
