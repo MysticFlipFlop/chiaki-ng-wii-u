@@ -15,7 +15,10 @@
 //   lang=<id>                              idioma UI: vacio=auto
 //                                          (eng si hay eng.pak, si no
 //                                          esp) (gui-107)
-//   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>
+//   console=<host>|<nombre>|<regist hex>|<morning hex>|<accountid hex>|<tipo>
+//                                        tipo opcional (gui-110): ps4/ps5;
+//                                        vacio = desconocido (se autocompleta
+//                                        con el regist o el discovery)
 //
 // Una linea "console=" por consola guardada. El modulo solo serializa/
 // parsea (sin FS): las entradas las hace main.cpp por el mismo cliente FS
@@ -32,6 +35,12 @@
 #define CONFIG_NAME_SIZE 0x20
 #define CONFIG_HOST_SIZE 48
 #define CONFIG_MAX_CONSOLES 8
+// Tipo de consola en config.ini (gui-110): se rellena al registrar y con
+// cada respuesta del discovery; UNKNOWN = linea vieja de 5 campos (se
+// autocompleta sola). Decide el arte del carrusel (PS4/PS5).
+#define CONFIG_CONSOLE_TYPE_UNKNOWN 0
+#define CONFIG_CONSOLE_TYPE_PS4 1
+#define CONFIG_CONSOLE_TYPE_PS5 2
 // Objetivos de mapeo del teclado USB (gui-105): 16 botones digitales
 // (orden = bits de ChiakiControllerButton) + L2/R2 + 4+4 direcciones
 // de stick a deflexion completa. El keymap guarda target -> tecla HID
@@ -46,6 +55,9 @@ struct ConfigConsole
 	uint8_t regist_key[CONFIG_REGIST_KEY_SIZE];
 	uint8_t morning[CONFIG_REGIST_KEY_SIZE];
 	uint8_t account_id[CONFIG_ACCOUNT_ID_SIZE];
+	// Tipo PS4/PS5 (gui-110, CONFIG_CONSOLE_TYPE_*): dibuja el arte
+	// correcto del carrusel aunque la consola este apagada.
+	uint8_t type;
 };
 
 struct Config
@@ -120,7 +132,8 @@ int config_find(const Config *cfg, const char *host);
 int config_set_console(Config *cfg, const char *host, const char *name,
 		       const uint8_t regist_key[CONFIG_REGIST_KEY_SIZE],
 		       const uint8_t morning[CONFIG_REGIST_KEY_SIZE],
-		       const uint8_t account_id[CONFIG_ACCOUNT_ID_SIZE]);
+		       const uint8_t account_id[CONFIG_ACCOUNT_ID_SIZE],
+		       uint8_t type);
 
 // Elimina la consola idx y COMPACTA el resto (los indices del menu son
 // slots consecutivos sin huecos). Si last_host apuntaba a esa consola,

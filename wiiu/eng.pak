@@ -46,6 +46,12 @@ Conectar=Connect
 Registrando... introduce el PIN que muestra la PS4=Registering... enter the PIN shown on the PS4
 ↑: registrar con el PIN de la PS4=↑: register with the PS4 PIN
 ←/→: elegir consola=←/→: select console
+Lista=Ready
+En espera=Standby
+Apagada=Off
+Sin datos=No data
+Juego: %s=Game: %s
+Sin juego=No game running
 
 # --- delete dialog ---
 No se pudo eliminar la consola=Could not delete the console

@@ -44,6 +44,8 @@ typedef enum GuiAsset {
 	GUI_ASSET_LOGO,      // wordmark "chiaki-ng"
 	GUI_ASSET_PS4_BODY,  // silueta de la PS4
 	GUI_ASSET_PS4_LIGHT, // tira de luz (se tiñe segun estado)
+	GUI_ASSET_PS5_BODY,  // silueta de la PS5 (gui-110)
+	GUI_ASSET_PS5_LIGHT, // tira de luz PS5 (rendijas del panel)
 	GUI_ASSET_RADAR_ON,  // discovery: consola detectada (discover-24px)
 	GUI_ASSET_RADAR_OFF, // discovery: buscando (discover-off-24px)
 	GUI_ASSET_DISC,      // disco de los chips de boton del gamepad

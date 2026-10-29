@@ -53,7 +53,7 @@
 #include <string.h>
 
 #define FONT_TEX_W 256 // mitad izq: glifos; mitad der: assets
-#define FONT_TEX_H 256 // glifos (128) + blanco (8) + assets hasta 255
+#define FONT_TEX_H 512 // glifos (128) + blanco (8) + assets PS5 hasta 325
 #define FONT_WHITE_ROW 128 // filas de bloque blanco para solidos
 #define FONT_WHITE_H 8
 
@@ -66,6 +66,10 @@
 #define ASSET_BODY_H 22 // consola PS4 (viewBox135x22.75) ->128x22
 #define ASSET_LIGHT_Y 104
 #define ASSET_LIGHT_H 22
+#define ASSET_PS5_BODY_Y 256
+#define ASSET_PS5_BODY_H 34 // consola PS5 (viewBox135x35.98) ->128x34
+#define ASSET_PS5_LIGHT_Y 292
+#define ASSET_PS5_LIGHT_H 34
 #define ASSET_RADAR_Y 128
 #define ASSET_RADAR_S 64            // discover-24px -> 64x64
 #define ASSET_RADAR_ON_X ASSET_LOGO_X
@@ -334,8 +338,8 @@ static bool font_create(void)
 		}
 	}
 
-	// Assets de chiaki-ng en la mitad derecha (wordmark; PS4 cuerpo y
-	// tira de luz por separado para teñirlos segun el estado).
+	// Assets de chiaki-ng en la mitad derecha (wordmark; PS4 y PS5 con
+	// cuerpo y tira de luz por separado para teñirlos segun el estado).
 	for(int r = 0; r < ASSET_LOGO_H; r++)
 		memcpy(p + (size_t)(ASSET_LOGO_Y + r) * pitch + ASSET_LOGO_X,
 		       gui_logo_mask + (size_t)r * GUI_ASSET_W, GUI_ASSET_W);
@@ -345,6 +349,12 @@ static bool font_create(void)
 	for(int r = 0; r < ASSET_LIGHT_H; r++)
 		memcpy(p + (size_t)(ASSET_LIGHT_Y + r) * pitch + ASSET_LOGO_X,
 		       gui_ps4_light + (size_t)r * GUI_ASSET_W, GUI_ASSET_W);
+	for(int r = 0; r < ASSET_PS5_BODY_H; r++)
+		memcpy(p + (size_t)(ASSET_PS5_BODY_Y + r) * pitch + ASSET_LOGO_X,
+		       gui_ps5_body + (size_t)r * GUI_ASSET_W, GUI_ASSET_W);
+	for(int r = 0; r < ASSET_PS5_LIGHT_H; r++)
+		memcpy(p + (size_t)(ASSET_PS5_LIGHT_Y + r) * pitch + ASSET_LOGO_X,
+		       gui_ps5_light + (size_t)r * GUI_ASSET_W, GUI_ASSET_W);
 	for(int r = 0; r < ASSET_RADAR_S; r++)
 	{
 		memcpy(p + (size_t)(ASSET_RADAR_Y + r) * pitch + ASSET_RADAR_ON_X,
@@ -675,6 +685,18 @@ void gui_asset_uvs(GuiAsset asset, float *u, float *v, float *w, float *h)
 		*v = (float)ASSET_LIGHT_Y / ah;
 		*w = (float)GUI_ASSET_W / aw;
 		*h = (float)ASSET_LIGHT_H / ah;
+		break;
+	case GUI_ASSET_PS5_BODY:
+		*u = (float)ASSET_LOGO_X / aw;
+		*v = (float)ASSET_PS5_BODY_Y / ah;
+		*w = (float)GUI_ASSET_W / aw;
+		*h = (float)ASSET_PS5_BODY_H / ah;
+		break;
+	case GUI_ASSET_PS5_LIGHT:
+		*u = (float)ASSET_LOGO_X / aw;
+		*v = (float)ASSET_PS5_LIGHT_Y / ah;
+		*w = (float)GUI_ASSET_W / aw;
+		*h = (float)ASSET_PS5_LIGHT_H / ah;
 		break;
 	case GUI_ASSET_RADAR_ON:
 		*u = (float)ASSET_RADAR_ON_X / aw;

@@ -125,6 +125,14 @@ static volatile bool g_config_dirty = false;
 // Consola resaltada en el menu (indice en g_config.consoles); la
 // navegan Izq/Dcha y la aplica apply_console() a los globals de sesion.
 static int g_menu_sel = 0;
+// Animacion del carrusel de consolas (gui-110): al cambiar con
+// Izq/Dcha la tarjeta saliente se desliza al lado opuesto con
+// fundido y la entrante entra desde el lado de la flecha.
+static uint64_t g_consanim_t0;
+static int g_consanim_dir;   // +1 = avance a la derecha
+static int g_consanim_from;  // indice de la tarjeta saliente
+static bool g_consanim_active;
+#define CONSANIM_MS 260
 // Fase 4c: pantalla de Ajustes (Abajo) con filas tocables en el DRC.
 // Mismos flujos que las teclas del menu: cuenta = SELECT, IP = X,
 // calidad = ZL/ZR (solo dentro de Ajustes); eliminar consola abre el
@@ -156,6 +164,10 @@ enum class SetAnim : uint8_t { None, Opening, Closing };
 static SetAnim g_set_anim = SetAnim::None;
 static uint64_t g_set_anim_t0;
 static char g_regist_target_host[CONFIG_HOST_SIZE]; // host del regist en curso
+
+// Tipo (PS4/PS5) de la consola del regist en curso (gui-110): se
+// persiste en config.ini para dibujar su arte aunque este apagada.
+static ChiakiTarget g_regist_target = CHIAKI_TARGET_PS4_10;
 
 // Menu contextual de presets de calidad (gui-61): se abre con A en la
 // fila de Calidad de Ajustes — lista los 9 presets del ladder para
@@ -878,12 +890,80 @@ static const char *target_str(ChiakiTarget t)
 	}
 }
 
+// Snapshot por consola del discovery (gui-110): estado, tipo y ultimo
+// juego visto, indexado por IP (no por slot del menu: borrar o
+// compactar no los desplaza). Protegido por g_host_mutex: lo escribe el
+// cb del servicio y lo copia el dibujo del carrusel.
+#define HOST_SNAP_MAX CONFIG_MAX_CONSOLES
+struct HostSnap
+{
+	bool used;
+	bool seen; // contesto en la ronda del cb en curso
+	char host[CONFIG_HOST_SIZE];
+	ChiakiDiscoveryHostState state;
+	ChiakiTarget target;
+	char game[64];
+};
+static HostSnap g_host_snaps[HOST_SNAP_MAX];
+
+// Snapshot de esa IP (o nullptr); el caller lleva g_host_mutex.
+static HostSnap *host_snap_find(const char *host)
+{
+	if(!host || !host[0])
+		return nullptr;
+	for(int i = 0; i < HOST_SNAP_MAX; i++)
+	{
+		if(g_host_snaps[i].used && !strcmp(g_host_snaps[i].host, host))
+			return &g_host_snaps[i];
+	}
+	return nullptr;
+}
+
+// Find o primer hueco libre; nullptr si la tabla esta llena.
+static HostSnap *host_snap_touch(const char *host)
+{
+	HostSnap *snap = host_snap_find(host);
+	if(snap)
+		return snap;
+	for(int i = 0; i < HOST_SNAP_MAX; i++)
+	{
+		if(!g_host_snaps[i].used)
+		{
+			snap = &g_host_snaps[i];
+			snap->used = true;
+			snprintf(snap->host, sizeof(snap->host), "%s", host);
+			return snap;
+		}
+	}
+	return nullptr;
+}
+
+// Descarta el snapshot de una consola borrada de la config.
+static void host_snap_drop(const char *host)
+{
+	HostSnap *snap = host_snap_find(host);
+	if(snap)
+		memset(snap, 0, sizeof(*snap));
+}
+
+// Contexto del cb del discovery (gui-110): log + modo en curso. En
+// broadcast la lista es exhaustiva (lo no presente esta apagado); con
+// IP dirigida solo contesta esa consola (modo Cemu/tecleo manual).
+struct DiscCb
+{
+	ChiakiLog *log;
+	bool broadcast;
+};
+static DiscCb g_disc_cb = { &g_chiaki_log, true };
+
 // cb del ChiakiDiscoveryService: se invoca (en el thread del servicio) cada vez
 // que cambia la lista de consolas conocidas (alta, cambio de estado o drop).
 // Ademas de loguear, deja un snapshot de la consola usable por ↑/A.
 static void discovery_state_cb(ChiakiDiscoveryHost *hosts, size_t hosts_count, void *user)
 {
-	ChiakiLog *log = (ChiakiLog *)user;
+	DiscCb *cbctx = (DiscCb *)user;
+	ChiakiLog *log = cbctx->log;
+	const bool broadcast = cbctx->broadcast;
 	CHIAKI_LOGI(log, "Discovery state: %zu host(s)", hosts_count);
 	for(size_t i = 0; i < hosts_count; i++)
 	{
@@ -900,20 +980,100 @@ static void discovery_state_cb(ChiakiDiscoveryHost *hosts, size_t hosts_count, v
 				    host->running_app_titleid ? host->running_app_titleid : "?");
 	}
 
-	// Preferimos una consola READY; si no, la primera conocida.
-	ChiakiDiscoveryHost *pick = nullptr;
+	// Estado por consola (gui-110): snapshot de cada host contestante
+	// (estado, tipo y juego) indexado por IP; el carrusel dibuja asi
+	// todas las tarjetas, no solo la elegida. En modo broadcast la
+	// lista es exhaustiva: lo que no contesta queda marcado caido.
+	chiaki_mutex_lock(&g_host_mutex);
 	for(size_t i = 0; i < hosts_count; i++)
 	{
-		if(hosts[i].state == CHIAKI_DISCOVERY_HOST_STATE_READY)
+		ChiakiDiscoveryHost *host = hosts + i;
+		if(!host->host_addr || !host->host_addr[0])
+			continue;
+		HostSnap *snap = host_snap_touch(host->host_addr);
+		if(!snap)
+			continue;
+		snap->seen = true;
+		snap->state = host->state;
+		snap->target =
+			chiaki_discovery_host_system_version_target(host);
+		if(host->running_app_name && host->running_app_name[0])
+			snprintf(snap->game, sizeof(snap->game), "%.*s",
+				 (int)(sizeof(snap->game) - 1),
+				 host->running_app_name);
+		else
+			snap->game[0] = '\0';
+		// Backfill del tipo en config.ini (gui-110): si la consola
+		// esta registrada y su tipo cambio o estaba sin fijar, se
+		// persiste para dibujar su arte aunque este apagada.
+		int cidx = config_find(&g_config, host->host_addr);
+		if(cidx >= 0 && !chiaki_target_is_unknown(snap->target))
 		{
-			pick = hosts + i;
-			break;
+			uint8_t type = chiaki_target_is_ps5(snap->target)
+					       ? (uint8_t)CONFIG_CONSOLE_TYPE_PS5
+					       : (uint8_t)CONFIG_CONSOLE_TYPE_PS4;
+			if(g_config.consoles[cidx].type != type)
+			{
+				g_config.consoles[cidx].type = type;
+				g_config_dirty = true;
+			}
+		}
+	}
+	if(broadcast)
+	{
+		// Ronda exhaustiva: los snapshots que no contestaron quedan
+		// caidos (apagados) hasta la proxima respuesta.
+		for(int i = 0; i < HOST_SNAP_MAX; i++)
+		{
+			HostSnap *snap = &g_host_snaps[i];
+			if(!snap->used || snap->seen)
+				continue;
+			bool present = false;
+			for(size_t j = 0; j < hosts_count && !present; j++)
+				present = hosts[j].host_addr &&
+					  !strcmp(hosts[j].host_addr, snap->host);
+			if(!present)
+			{
+				snap->state =
+					CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
+				snap->game[0] = '\0';
+			}
+		}
+	}
+	for(int i = 0; i < HOST_SNAP_MAX; i++)
+		g_host_snaps[i].seen = false;
+
+	// Pick (gui-110): preferimos la consola SELECCIONADA (g_host_ip);
+	// si no contesta, la primera READY; si no, la primera conocida.
+	// Antes la primera READY ganaba siempre: con las dos consolas
+	// encendidas A conectaba con la equivocada aunque resaltaras otra.
+	ChiakiDiscoveryHost *pick = nullptr;
+	if(g_host_ip[0])
+	{
+		for(size_t i = 0; i < hosts_count; i++)
+		{
+			if(hosts[i].host_addr &&
+			   !strcmp(hosts[i].host_addr, g_host_ip))
+			{
+				pick = hosts + i;
+				break;
+			}
+		}
+	}
+	if(!pick)
+	{
+		for(size_t i = 0; i < hosts_count; i++)
+		{
+			if(hosts[i].state ==
+			   CHIAKI_DISCOVERY_HOST_STATE_READY)
+			{
+				pick = hosts + i;
+				break;
+			}
 		}
 	}
 	if(!pick && hosts_count)
 		pick = hosts;
-
-	chiaki_mutex_lock(&g_host_mutex);
 	if(pick && pick->host_addr)
 	{
 		snprintf(g_host_addr, sizeof(g_host_addr), "%s", pick->host_addr);
@@ -940,7 +1100,10 @@ static bool start_discovery(const char *host)
 	options.hosts_max = DISCOVERY_HOSTS_MAX;
 	options.host_drop_pings = DISCOVERY_DROP_PINGS;
 	options.cb = discovery_state_cb;
-	options.cb_user = &g_chiaki_log;
+	// gui-110: el cb sabe si el discovery es broadcast (lista
+	// exhaustiva) o dirigido a una IP (solo esa consola contesta).
+	g_disc_cb.broadcast = (host == nullptr || !host[0]);
+	options.cb_user = &g_disc_cb;
 
 	struct sockaddr_in send_addr = {};
 	send_addr.sin_family = AF_INET;
@@ -1675,7 +1838,11 @@ static bool apply_console(int idx)
 	if(idx < 0 || idx >= config_console_count(&g_config))
 		return false;
 	const ConfigConsole *c = &g_config.consoles[idx];
+	// El cb del discovery lee g_host_ip bajo el mutua para preferir
+	// esta consola al hacer el pick (gui-110).
+	chiaki_mutex_lock(&g_host_mutex);
 	snprintf(g_host_ip, sizeof(g_host_ip), "%s", c->host);
+	chiaki_mutex_unlock(&g_host_mutex);
 	memcpy(g_regist_key, c->regist_key, sizeof(g_regist_key));
 	memcpy(g_morning, c->morning, sizeof(g_morning));
 	if(c->name[0])
@@ -1777,7 +1944,15 @@ static void delete_selected_console(void)
 	snprintf(host, sizeof(host), "%s", g_config.consoles[idx].host);
 	snprintf(name, sizeof(name), "%s", g_config.consoles[idx].name);
 
-	if(!config_del_console(&g_config, idx))
+	// gui-110: la mutua cubre el compactado (el cb del discovery
+	// puede estar leyendo las consolas para el backfill del tipo)
+	// y descarta el snapshot de la consola borrada.
+	chiaki_mutex_lock(&g_host_mutex);
+	bool del_ok = config_del_console(&g_config, idx);
+	if(del_ok)
+		host_snap_drop(host);
+	chiaki_mutex_unlock(&g_host_mutex);
+	if(!del_ok)
 	{
 		logprintf("Borrado: config_del_console fallo (idx=%d)", idx);
 		snprintf(g_last_session_msg, sizeof(g_last_session_msg),
@@ -1796,7 +1971,10 @@ static void delete_selected_console(void)
 		// Lista vacia: nada de la consola borrada queda vivo —
 		// ni cuenta, ni claves, ni IP de sesion.
 		g_registered = false;
+		// El cb del discovery lee g_host_ip bajo el mutua (gui-110).
+		chiaki_mutex_lock(&g_host_mutex);
 		g_host_ip[0] = 0;
+		chiaki_mutex_unlock(&g_host_mutex);
 		g_host_nickname[0] = 0;
 		memset(g_regist_key, 0, sizeof(g_regist_key));
 		memset(g_morning, 0, sizeof(g_morning));
@@ -1842,7 +2020,10 @@ static void regist_event_cb(ChiakiRegistEvent *event, void *user)
 			config_set_console(&g_config, g_regist_target_host,
 					   rh->server_nickname,
 					   (const uint8_t *)rh->rp_regist_key,
-					   rh->rp_key, g_psn_account_id);
+					   rh->rp_key, g_psn_account_id,
+					   chiaki_target_is_ps5(g_regist_target)
+						   ? CONFIG_CONSOLE_TYPE_PS5
+						   : CONFIG_CONSOLE_TYPE_PS4);
 			snprintf(g_config.last_host, sizeof(g_config.last_host),
 				 "%s", g_regist_target_host);
 			g_config_dirty = true;
@@ -1893,6 +2074,7 @@ static bool start_regist(uint32_t pin)
 	}
 	// Fase 4a: el cb de regist usa este host para guardar la consola.
 	snprintf(g_regist_target_host, sizeof(g_regist_target_host), "%s", host);
+	g_regist_target = target; // tipo PS4/PS5 para config.ini (gui-110)
 
 	if(target == CHIAKI_TARGET_PS4_UNKNOWN || target == CHIAKI_TARGET_PS5_UNKNOWN)
 	{
@@ -2968,7 +3150,10 @@ static void swkbd_frame(VPADStatus &status)
 		case Prompt::IP:
 			if(valid_ipv4(input))
 			{
-				snprintf(g_host_ip, sizeof(g_host_ip), "%s", input);
+				chiaki_mutex_lock(&g_host_mutex);
+				snprintf(g_host_ip, sizeof(g_host_ip), "%s",
+					 input);
+				chiaki_mutex_unlock(&g_host_mutex);
 				logprintf("IP de la consola fijada: %s", g_host_ip);
 				restart_discovery();
 			}
@@ -3128,12 +3313,13 @@ static void swkbd_shutdown()
 // Menu principal: se dibuja en TV y DRC cuando no hay sesion activa.
 // Replica el look de chiaki-ng (gui/src/qml/Main.qml): tema Qt Material
 // Dark (fondo #121212, ToolBar #1e1e1e, acento #00a7ff) con su ToolBar de
-// botones planos, filas tipo ItemDelegate de180px con el icono PS4 real
-// (console-ps4.svg: cuerpo + tira de luz #light_on/#light_standby) y la
-// columna de acciones de la fila destacada. Izq/Dcha cambia la seleccion
-// (apply_console vuelca IP+claves a los globals con los que conecta A).
+// botones planos y un carrusel cover-flow de consolas (gui-110): la
+// elegida al centro en grande con su arte PS4/PS5 real (cuerpo + tira de
+// luz #light_on/#light_standby), nombre, IP, estado y juego en curso;
+// las demas asoman a los lados. Izq/Dcha la desliza (apply_console
+// vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-109"
+#define APP_BUILD_TAG "gui-110"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4566,6 +4752,157 @@ static void settings_button_geom(int w, int h, int *bx, int *by, int *bd)
 	*by = h - m - u * 3 - *bd - u * 2;
 }
 
+// Paleta del menu para las tarjetas del carrusel (gui-110).
+struct MenuPal
+{
+	uint32_t bg, sel, text, text2, text3, accent, standby, white,
+	    icon, off, chip;
+};
+
+// Multiplica el alfa de un color (tarjetas vecinas y carrusel).
+static uint32_t col_fade(uint32_t c, float k)
+{
+	if(k >= 1.f)
+		return c;
+	uint32_t a = (uint32_t)((float)(c & 0xffu) * k);
+	return (c & 0xffffff00u) | a;
+}
+
+// Snapshot de una IP en una copia local de la tabla (gui-110); el
+// caller ya no lleva el mutua. nullptr si esa IP no tiene fila.
+static const HostSnap *host_snap_of(const HostSnap *snaps, const char *host)
+{
+	for(int i = 0; i < HOST_SNAP_MAX; i++)
+	{
+		if(snaps[i].used && !strcmp(snaps[i].host, host))
+			return &snaps[i];
+	}
+	return nullptr;
+}
+
+// Tarjeta de una consola del carrusel (gui-110): arte real PS4/PS5 con
+// la tira de luz teñida por estado (#light_on/#light_standby del SVG),
+// nombre, IP, estado y juego en ejecucion; la activa lleva el chip A de
+// Conectar/Despertar. "k" atenúa todos los colores (vecinas y fundidos).
+static void draw_console_card(const MenuPal *p, int idx, float x, float y,
+			      int cw, int ch, int u, int scale, float k,
+			      bool sel_card, bool regist_now, bool seen,
+			      ChiakiDiscoveryHostState state, const char *game,
+			      ChiakiTarget target)
+{
+	const ConfigConsole *con = &g_config.consoles[idx];
+
+	// Fondo Material de la tarjeta + tinte de acento en la activa.
+	gui_rect(x, y, (float)cw, (float)ch, col_fade(p->bg, k));
+	if(sel_card)
+	{
+		gui_rect(x, y, (float)cw, (float)ch, col_fade(p->sel, k));
+		gui_rect(x, y, (float)cw, (float)(u / 3),
+			 col_fade(p->accent, k));
+	}
+
+	// Arte de la consola: PS5 si el tipo lo dice (config.ini o
+	// discovery), PS4 por defecto; la luz indica el estado.
+	bool ps5 = chiaki_target_is_ps5(target) ||
+		   con->type == CONFIG_CONSOLE_TYPE_PS5;
+	float bu, bv, bw, bh, su, sv, sw, sh;
+	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_BODY : GUI_ASSET_PS4_BODY,
+		       &bu, &bv, &bw, &bh);
+	gui_asset_uvs(ps5 ? GUI_ASSET_PS5_LIGHT : GUI_ASSET_PS4_LIGHT,
+		       &su, &sv, &sw, &sh);
+	float art_w = (float)(u * 14);
+	float art_h = art_w * (ps5 ? (34.f / 128.f) : (22.f / 128.f));
+	float art_x = x + ((float)cw - art_w) / 2.f;
+	float art_y = y + (float)(u * 3);
+	uint32_t light = col_fade(p->off, k);
+	if(seen)
+	{
+		if(state == CHIAKI_DISCOVERY_HOST_STATE_READY)
+			light = col_fade(p->accent, k);
+		else if(state == CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
+			light = col_fade(p->standby, k);
+	}
+	gui_image(art_x, art_y, art_w, art_h, bu, bv, bw, bh,
+		  col_fade(p->icon, k));
+	gui_image(art_x, art_y, art_w, art_h, su, sv, sw, sh, light);
+
+	// Nombre (grande, acortado si no cabe) + direccion IP.
+	float tx = x + (float)(u * 3);
+	int name_scale = scale + 1;
+	int max_tw = cw - u * 6;
+	char nm[CONFIG_NAME_SIZE + 1];
+	snprintf(nm, sizeof(nm), "%s", con->name[0] ? con->name : "?");
+	while(nm[0] && gui_text_width(nm, name_scale) > max_tw)
+		nm[strlen(nm) - 1] = '\0';
+	float ty = art_y + art_h + (float)(u * 3);
+	gui_text(tx, ty, nm, col_fade(p->text, k), name_scale);
+	gui_text(tx, ty + (float)(u * 3), con->host, col_fade(p->text2, k),
+		 scale);
+
+	// Estado con color + juego en ejecucion (solo el discovery en
+	// READY trae running_app_name; el resto no tiene juego que
+	// mostrar).
+	const char *state_txt;
+	uint32_t state_col;
+	if(regist_now && sel_card)
+	{
+		state_txt = tr("Estado: registrando...");
+		state_col = p->standby;
+	}
+	else if(!seen)
+	{
+		state_txt = tr("Apagada");
+		state_col = p->text3;
+	}
+	else if(state == CHIAKI_DISCOVERY_HOST_STATE_READY)
+	{
+		state_txt = tr("Lista");
+		state_col = p->accent;
+	}
+	else if(state == CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
+	{
+		state_txt = tr("En espera");
+		state_col = p->standby;
+	}
+	else
+	{
+		state_txt = tr("Sin datos");
+		state_col = p->text3;
+	}
+	float sy = ty + (float)(u * 5);
+	gui_text(tx, sy, state_txt, col_fade(state_col, k), scale);
+	if(seen && state == CHIAKI_DISCOVERY_HOST_STATE_READY)
+	{
+		char line[96];
+		if(game[0])
+			snprintf(line, sizeof(line), tr("Juego: %s"), game);
+		else
+			snprintf(line, sizeof(line), "%s", tr("Sin juego"));
+		while(line[0] && gui_text_width(line, scale) > max_tw - u * 6)
+			line[strlen(line) - 1] = '\0';
+		gui_text(tx, sy + (float)(u * 2), line,
+			 col_fade(p->text2, k), scale);
+	}
+
+	// Accion de la tarjeta activa (chip A en color acento), como la
+	// columna de acciones de chiaki-ng abajo a la derecha.
+	if(sel_card)
+	{
+		const char *act = (seen && state ==
+				   CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
+					  ? tr("Despertar")
+					  : tr("Conectar");
+		float chip_d = (float)(scale * 12);
+		float chip_gap = (float)(scale * 6);
+		float ax = x + (float)cw - (float)(u * 3) - chip_d -
+			   chip_gap - gui_text_width(act, scale);
+		float ay = y + (float)ch - (float)(u * 4) - (float)scale * 4.f;
+		draw_button_chip(ax, ay - (chip_d - (float)u) / 2.f,
+				 scale, 'A', p->accent, p->white);
+		gui_text(ax + chip_d + chip_gap, ay, act, p->accent, scale);
+	}
+}
+
 static void draw_menu(int w, int h)
 {
 	// Escala2x en TV (>=1280) y1x en DRC: la fuente8x8 queda legible
@@ -4593,11 +4930,10 @@ static void draw_menu(int w, int h)
 	const uint32_t c_chip = GUI_RGBA(0x54, 0x54, 0x54, 0xff); // pastilla
 	const uint32_t c_chip_fg = GUI_RGBA(0xff, 0xff, 0xff, 0xde);
 
-	// UVs de los assets del atlas (wordmark + PS4).
-	float lu, lv, lw, lh, bu, bv, bw, bh, su, sv, sw, sh;
+	// UVs del wordmark (cada tarjeta del carrusel trae su arte
+	// PS4/PS5 — gui-110).
+	float lu, lv, lw, lh;
 	gui_asset_uvs(GUI_ASSET_LOGO, &lu, &lv, &lw, &lh);
-	gui_asset_uvs(GUI_ASSET_PS4_BODY, &bu, &bv, &bw, &bh);
-	gui_asset_uvs(GUI_ASSET_PS4_LIGHT, &su, &sv, &sw, &sh);
 
 	// Fondo + ToolBar (chiaki-ng: barra de80/1080 con botones planos).
 	gui_rect(0.f, 0.f, (float)w, (float)h, c_bg);
@@ -5185,17 +5521,11 @@ static void draw_menu(int w, int h)
 	int count = config_console_count(&g_config);
 	int sel = (g_menu_sel >= 0 && g_menu_sel < count) ? g_menu_sel : 0;
 	int list_y = bar_h + u * 2;
-	int row_h = u * 7; // filas tipo ItemDelegate (180/1080 de chiaki)
-	int max_rows = (h - u * 4 - list_y) / row_h;
-	if(max_rows < 2)
-		max_rows = 2;
-	int rows = count == 0 ? 2 : (count < max_rows ? count : max_rows);
 
 	// Snapshot del discovery de la consola SELECCIONADA (cb desde su
 	// thread; el filtro unicast la dirige a su IP).
 	chiaki_mutex_lock(&g_host_mutex);
 	bool found = g_host_found;
-	ChiakiDiscoveryHostState st = g_host_state;
 	chiaki_mutex_unlock(&g_host_mutex);
 
 	if(count == 0)
@@ -5234,103 +5564,140 @@ static void draw_menu(int w, int h)
 	}
 	else
 	{
-		// Ventana de visibilidad si hay mas consolas que filas.
-		int start = sel - rows + 1;
-		if(start < 0)
-			start = 0;
-		for(int i = 0; i < rows; i++)
+		// Carrusel cover-flow de consolas (gui-110): la elegida al
+		// centro en grande con su arte PS4/PS5 real (cuerpo + tira
+		// de luz teñida por estado); las vecinas asoman recortadas
+		// a los lados. Izq/Dcha lo desliza (260 ms, ease-out) con
+		// fundido de la saliente. Cada tarjeta lee su estado del
+		// snapshot por IP: en broadcast (Y) se refrescan todas; con
+		// IP dirigida solo contesta la elegida (Cemu ignora el
+		// broadcast, por eso Izq/Dcha no lo usa).
+		HostSnap snaps[HOST_SNAP_MAX];
+		chiaki_mutex_lock(&g_host_mutex);
+		memcpy(snaps, g_host_snaps, sizeof(snaps));
+		chiaki_mutex_unlock(&g_host_mutex);
+
+		const MenuPal pal = { c_bg, c_sel, c_text, c_text2, c_text3,
+				      c_accent, c_standby, c_white, c_icon,
+				      c_off, c_chip };
+		int card_w = w * 68 / 100;
+		int card_h = h - list_y - u * 8;
+		if(card_h < u * 12)
+			card_h = u * 12;
+		float card_x = ((float)w - (float)card_w) / 2.f;
+		float card_y = (float)list_y;
+		int card_gap = u * 3;
+		bool regist_now = g_regist_state != RegistState::Idle;
+
+		// Progreso del carrusel: ease-out 1-(1-t)^2 (gui-108).
+		bool anim = g_consanim_active;
+		float e = 1.f;
+		if(anim)
 		{
-			int idx = start + i;
-			const ConfigConsole *con = &g_config.consoles[idx];
-			int y = list_y + i * row_h;
-			bool is_sel = (idx == sel);
-			bool live = is_sel && found;
-
-			// ItemDelegate destacado de Material: acento suave
-			// + barra vertical como en el ListView de chiaki-ng.
-			if(is_sel)
+			float ms = (float)((OSGetTime() - g_consanim_t0) /
+					   OSMillisecondsToTicks(1));
+			if(ms >= (float)CONSANIM_MS)
 			{
-				gui_rect(0.f, (float)y, (float)w,
-					 (float)row_h, c_sel);
-				gui_rect(0.f, (float)y, (float)(u / 4),
-					 (float)row_h, c_accent);
+				g_consanim_active = false;
+				anim = false;
 			}
-
-			// Icono PS4 real: cuerpo + tira de luz teñida por
-			// estado (azul encendida, ámbar standby, apagada si
-			// no hay discovery), igual que #light_on/#light_standby.
-			uint32_t light = c_off;
-			if(live)
-			{
-				if(st == CHIAKI_DISCOVERY_HOST_STATE_READY)
-					light = c_accent;
-				else if(st ==
-					CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
-					light = c_standby;
-			}
-			float icon_w = (float)(u * 8);
-			float icon_h = icon_w * (22.f / 128.f);
-			float icon_x = (float)(m + u);
-			float icon_y = (float)y +
-				      ((float)row_h - icon_h) / 2.f;
-			gui_image(icon_x, icon_y, icon_w, icon_h, bu, bv, bw,
-				  bh, c_icon);
-			gui_image(icon_x, icon_y, icon_w, icon_h, su, sv, sw,
-				  sh, light);
-
-			// Labels del delegate: nombre / dirección / estado.
-			int tx = m + u * 10;
-			int lh2 = u * 2;
-			int ty = y + (row_h - lh2 * 3) / 2;
-			gui_text((float)tx, (float)ty,
-				 con->name[0] ? con->name : "?", c_text,
-				 scale);
-			char line[72];
-			snprintf(line, sizeof(line), tr("Dirección: %s"),
-				 con->host);
-			gui_text((float)tx, (float)(ty + lh2), line, c_text2,
-				 scale);
-			const char *state;
-			if(!is_sel)
-				state = tr("Estado: -");
-			else if(g_regist_state != RegistState::Idle)
-				state = tr("Estado: registrando...");
-			else if(!found)
-				state = tr("Estado: sin discovery (Y=buscar)");
-			else if(st == CHIAKI_DISCOVERY_HOST_STATE_READY)
-				state = tr("Estado: lista");
-			else if(st == CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
-				state = tr("Estado: en espera");
 			else
-				state = tr("Estado: discovery");
-			gui_text((float)tx, (float)(ty + lh2 * 2), state,
-				 c_text2, scale);
-
-			// Acciones de la fila destacada (chiaki-ng: columna
-			// de botones planos a la derecha: Conectar/Wake Up),
-			// con chip A en color acento.
-			if(is_sel)
 			{
-				const char *act =
-					(found && st ==
-						 CHIAKI_DISCOVERY_HOST_STATE_STANDBY)
-						? tr("Despertar")
-						: tr("Conectar");
-				float ax = (float)(w - m) - chip_d -
-					   chip_gap - gui_text_width(act, scale);
-				float ay = (float)(y + (row_h - u) / 2);
-				draw_button_chip(ax, ay - (chip_d - (float)u) / 2.f,
-						 scale, 'A', c_accent, c_white);
-				gui_text(ax + chip_d + chip_gap, ay, act,
-					 c_accent, scale);
+				float t = ms / (float)CONSANIM_MS;
+				e = 1.f - (1.f - t) * (1.f - t);
 			}
 		}
-	}
 
-	// Indicador de posicion "n/m" cuando la ventana no muestra toda
-	// la lista (arriba a la derecha, sobre la primera fila).
-	if(count > rows)
-	{
+		const HostSnap *ss = host_snap_of(
+			snaps, g_config.consoles[sel].host);
+		bool s_seen =
+			ss && ss->state != CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
+
+		if(anim)
+		{
+			// Transicion: la saliente se va al lado opuesto con
+			// fundido; la entrante entra desde el lado de la
+			// flecha (sin vecinas durante el cambio).
+			int from = g_consanim_from;
+			if(from >= 0 && from < count && from != sel)
+			{
+				const HostSnap *fs = host_snap_of(
+					snaps, g_config.consoles[from].host);
+				bool f_seen = fs && fs->state !=
+						      CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
+				draw_console_card(&pal, from,
+						  card_x - (float)g_consanim_dir *
+							  (float)w * e,
+						  card_y, card_w, card_h, u,
+						  scale, 1.f - e, false,
+						  regist_now, f_seen,
+						  fs ? fs->state
+						     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+						  fs ? fs->game : "",
+						  fs ? fs->target
+						     : CHIAKI_TARGET_PS4_UNKNOWN);
+			}
+			draw_console_card(&pal, sel,
+					  card_x + (float)g_consanim_dir *
+						  (1.f - e) * (float)w,
+					  card_y, card_w, card_h, u, scale, e,
+					  true, regist_now, s_seen,
+					  ss ? ss->state
+					     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					  ss ? ss->game : "",
+					  ss ? ss->target
+					     : CHIAKI_TARGET_PS4_UNKNOWN);
+		}
+		else
+		{
+			// Reposo: vecinas asomando a los lados (tenue, solo
+			// su borde visible tras el margen) y la elegida al
+			// centro en color pleno.
+			const int nbr[2] = { sel - 1, sel + 1 };
+			for(int s = 0; s < 2; s++)
+			{
+				int ni = nbr[s];
+				if(ni < 0 || ni >= count)
+					continue;
+				const HostSnap *ns = host_snap_of(
+					snaps, g_config.consoles[ni].host);
+				bool n_seen = ns && ns->state !=
+						      CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN;
+				draw_console_card(&pal, ni,
+						  card_x + (s ? 1.f : -1.f) *
+							  ((float)card_w +
+							   (float)card_gap),
+						  card_y, card_w, card_h, u,
+						  scale, 0.35f, false,
+						  regist_now, n_seen,
+						  ns ? ns->state
+						     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+						  ns ? ns->game : "",
+						  ns ? ns->target
+						     : CHIAKI_TARGET_PS4_UNKNOWN);
+			}
+			draw_console_card(&pal, sel, card_x, card_y, card_w,
+					  card_h, u, scale, 1.f, true,
+					  regist_now, s_seen,
+					  ss ? ss->state
+					     : CHIAKI_DISCOVERY_HOST_STATE_UNKNOWN,
+					  ss ? ss->game : "",
+					  ss ? ss->target
+					     : CHIAKI_TARGET_PS4_UNKNOWN);
+		}
+
+		// Puntos indicadores centrados bajo la tarjeta.
+		float dot_d = (float)u;
+		float dot_step = (float)(u * 2);
+		float dots_x = ((float)w -
+				 ((float)(count - 1) * dot_step + dot_d)) /
+			       2.f;
+		float dots_y = card_y + (float)card_h + (float)(u * 2);
+		for(int i = 0; i < count; i++)
+			gui_rect(dots_x + (float)i * dot_step, dots_y, dot_d,
+				 dot_d, i == sel ? c_accent : c_text3);
+
+		// Contador "n/m" arriba a la derecha, junto a la tarjeta.
 		char pos[16];
 		snprintf(pos, sizeof(pos), "%d/%d", sel + 1, count);
 		gui_text((float)(w - m) - gui_text_width(pos, scale),
@@ -5977,7 +6344,9 @@ int main(int argc, char **argv)
 				{
 					if(g_host_ip[0])
 					{
+						chiaki_mutex_lock(&g_host_mutex);
 						g_host_ip[0] = 0;
+						chiaki_mutex_unlock(&g_host_mutex);
 						logprintf("Y: IP borrada — modo broadcast");
 						restart_discovery();
 					}
@@ -6034,8 +6403,15 @@ int main(int argc, char **argv)
 							int idx = (g_menu_sel + dir +
 								   count) %
 								  count;
+							int prev = g_menu_sel;
 							if(apply_console(idx))
 							{
+								// Carrusel (gui-110): la tarjeta
+								// saliente anima el cambio.
+								g_consanim_from = prev;
+								g_consanim_dir = dir;
+								g_consanim_t0 = OSGetTime();
+								g_consanim_active = true;
 								logprintf(
 									"Elegida consola %d/%d: '%s' (%s)",
 									idx + 1, count,

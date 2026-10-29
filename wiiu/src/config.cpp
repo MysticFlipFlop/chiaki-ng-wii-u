@@ -101,7 +101,8 @@ int config_console_count(const Config *cfg)
 int config_set_console(Config *cfg, const char *host, const char *name,
 		       const uint8_t regist_key[CONFIG_REGIST_KEY_SIZE],
 		       const uint8_t morning[CONFIG_REGIST_KEY_SIZE],
-		       const uint8_t account_id[CONFIG_ACCOUNT_ID_SIZE])
+		       const uint8_t account_id[CONFIG_ACCOUNT_ID_SIZE],
+		       uint8_t type)
 {
 	if(!host || !host[0])
 		return -1;
@@ -128,6 +129,10 @@ int config_set_console(Config *cfg, const char *host, const char *name,
 	memcpy(c->regist_key, regist_key, CONFIG_REGIST_KEY_SIZE);
 	memcpy(c->morning, morning, CONFIG_REGIST_KEY_SIZE);
 	memcpy(c->account_id, account_id, CONFIG_ACCOUNT_ID_SIZE);
+	// Tipo PS4/PS5 (gui-110): un "desconocido" (linea vieja o
+	// llamada sin tipo) no pisa el ya conocido.
+	if(type != CONFIG_CONSOLE_TYPE_UNKNOWN)
+		c->type = type;
 	return idx;
 }
 
@@ -200,9 +205,17 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 		hex_encode(key_hex, c->regist_key, CONFIG_REGIST_KEY_SIZE);
 		hex_encode(morning_hex, c->morning, CONFIG_REGIST_KEY_SIZE);
 		hex_encode(acc_hex, c->account_id, CONFIG_ACCOUNT_ID_SIZE);
+		// Tipo (gui-110): campo opcional ps4/ps5; vacio si
+		// desconocido (se autocompleta con el regist/discovery).
+		const char *type_str = c->type == CONFIG_CONSOLE_TYPE_PS5
+				      ? "ps5"
+				      : (c->type == CONFIG_CONSOLE_TYPE_PS4
+					     ? "ps4"
+					     : "");
 		int n = snprintf(buf + off, buf_size - off,
-				 "console=%s|%s|%s|%s|%s\n",
-				 c->host, c->name, key_hex, morning_hex, acc_hex);
+				 "console=%s|%s|%s|%s|%s|%s\n",
+				 c->host, c->name, key_hex, morning_hex,
+				 acc_hex, type_str);
 		if(n < 0)
 			break;
 		off += (size_t)n;
@@ -215,22 +228,30 @@ size_t config_serialize(const Config *cfg, char *buf, size_t buf_size)
 	return off;
 }
 
-// host|nombre|regist hex|morning hex|accountid hex (entre v y vend).
+// host|nombre|regist hex|morning hex|accountid hex[|ps4|ps5] (entre v y
+// vend). El 6º campo (tipo, gui-110) es opcional.
 static void parse_console_line(Config *cfg, const char *v, const char *vend)
 {
-	const char *fields[5];
-	const char *ends[5];
+	const char *fields[6];
+	const char *ends[6];
+	int nfields = 5; // minimos obligatorios
 	fields[0] = v;
-	for(int f = 0; f < 4; f++)
+	for(int f = 0; f < 5; f++)
 	{
 		const char *sep = (const char *)memchr(fields[f], '|',
 						       (size_t)(vend - fields[f]));
 		if(!sep)
+		{
+			if(f == 4)
+				break; // sin campo de tipo (linea vieja)
 			return; // linea incompleta: se ignora
+		}
 		ends[f] = sep;
 		fields[f + 1] = sep + 1;
+		if(f == 4)
+			nfields = 6;
 	}
-	ends[4] = vend;
+	ends[nfields - 1] = vend;
 
 	char host[CONFIG_HOST_SIZE];
 	char name[CONFIG_NAME_SIZE + 1];
@@ -254,7 +275,19 @@ static void parse_console_line(Config *cfg, const char *v, const char *vend)
 	if(!hex_decode(acc, sizeof(acc), acc_hex))
 		memset(acc, 0, sizeof(acc));
 
-	config_set_console(cfg, host, name, key, morning, acc);
+	uint8_t type = CONFIG_CONSOLE_TYPE_UNKNOWN;
+	if(nfields == 6)
+	{
+		// Campo de tipo opcional (gui-110): ps4/ps5.
+		char t[8];
+		field_copy(t, sizeof(t), fields[5], ends[5]);
+		if(!strcmp(t, "ps5"))
+			type = CONFIG_CONSOLE_TYPE_PS5;
+		else if(!strcmp(t, "ps4"))
+			type = CONFIG_CONSOLE_TYPE_PS4;
+	}
+
+	config_set_console(cfg, host, name, key, morning, acc, type);
 }
 
 // keymap (gui-105): pares "objetivo:tecla" hex separados por

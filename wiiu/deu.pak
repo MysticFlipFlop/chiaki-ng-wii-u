@@ -1,0 +1,138 @@
+# chiaki-ng Wii U — Deutsches Sprachpaket (gui-107)
+# Neben der config.ini ablegen:  sd:/wiiu/apps/chiaki/deu.pak
+#
+# Format (UTF-8, ein Eintrag pro Zeile):
+#   @lang=Deutsch          Anzeigename der Sprache (erste Zeile)
+#   # Kommentar            wird ignoriert
+#   Spanischer Quelltext=Übersetzung
+#
+# Der Schlüssel ist das exakte spanische Literal aus dem Code; fehlt ein
+# Schlüssel, wird der Quelltext als Fallback verwendet. Enthält ein SCHLÜSSEL
+# ein '=', schreibe ihn als '==' (der Parser teilt beim ersten ungepaarten
+# '='). Werte dürfen '=' normal verwenden. Platzhalter %s / %d / %.24s
+# müssen beibehalten werden.
+@lang=Deutsch
+
+# --- Sitzung / Karten ---
+Última sesión: detenida=Letzte Sitzung: gestoppt
+Última sesión fallida: %s — %s=Letzte Sitzung fehlgeschlagen: %s — %s
+Última sesión fallida: %s=Letzte Sitzung fehlgeschlagen: %s
+Conectando con %s%s=Verbinde mit %s%s
+la consola=der Konsole
+para cancelar=zum Abbrechen
+Modo mando activo=Controller-Modus aktiv
+El video esta en tu consola=Das Video läuft auf deiner Konsole
+Sin video: solo audio y mando=Kein Video: nur Audio und Controller
+Sin vídeo/audio=Kein Video/Audio
+Sin vídeo=Kein Video
+Normal=Normal
+
+# --- Symbolleiste / Konsolenliste / Fußzeile ---
+PIN (↑)=PIN (↑)
+ID=ID
+IP=IP
+Buscar=Suchen
+Consola detectada - pulsa ↑ para registrar=Konsole erkannt - drücke ↑ zum Registrieren
+Sin consolas registradas - pulsa ↑ con el PIN de la PS4=Keine registrierten Konsolen - drücke ↑ mit dem PS4-PIN
+Buscando consolas en la red...=Suche nach Konsolen im Netzwerk...
+Dirección: %s=Adresse: %s
+Estado: -=Status: -
+Estado: registrando...=Status: Registrierung läuft...
+Estado: sin discovery (Y==buscar)=Status: kein Discovery (Y=Suchen)
+Estado: lista=Status: bereit
+Estado: en espera=Status: Bereitschaft
+Estado: discovery=Status: Discovery
+Despertar=Aufwecken
+Conectar=Verbinden
+Registrando... introduce el PIN que muestra la PS4=Registrierung läuft... gib den auf der PS4 angezeigten PIN ein
+↑: registrar con el PIN de la PS4=↑: mit dem PS4-PIN registrieren
+←/→: elegir consola=←/→: Konsole auswählen
+Lista=Bereit
+En espera=Bereitschaft
+Apagada=Aus
+Sin datos=Keine Daten
+Juego: %s=Spiel: %s
+Sin juego=Kein Spiel
+
+# --- Löschdialog ---
+No se pudo eliminar la consola=Konsole konnte nicht gelöscht werden
+Consola eliminada: %s=Konsole gelöscht: %s
+Sin consolas registradas - pulsa ↑ con el PIN=Keine registrierten Konsolen - drücke ↑ mit dem PIN
+¿Eliminar consola?=Konsole löschen?
+Se eliminará '%.24s' de la lista.='%.24s' wird aus der Liste entfernt.
+Dirección: %.32s=Adresse: %.32s
+volver=Zurück
+Eliminar=Löschen
+
+# --- Einstellungen ---
+Ajustes=Einstellungen
+ID PSN=PSN-ID
+sin definir=nicht festgelegt
+IP de la PS4=PS4-IP
+sin fijar=nicht festgelegt
+Calidad de video=Videoqualität
+VSync=VSync
+Log.txt=Log.txt
+Vibración=Vibration
+Modo=Modus
+Idioma=Sprache
+Teclado=Tastatur
+1 asignada=1 zugewiesen
+%d asignadas=%d zugewiesen
+sin mapear=nicht belegt
+Eliminar consola=Konsole löschen
+sin consolas=keine Konsolen
+↑/↓: elegir   A o tocar: abrir   B: volver=↑/↓: auswählen   A oder Touch: öffnen   B: Zurück
+
+# --- Kontextmenüs ---
+↑/↓: elegir   A: elegir   B: cerrar=↑/↓: auswählen   A: wählen   B: Schließen
+↑/↓: elegir   A: mapear   B: cerrar=↑/↓: auswählen   A: belegen   B: Schließen
+
+# --- Tastatur-Belegung ---
+Mapear: %s=Belegen: %s
+Pulsa una tecla...=Drücke eine Taste...
+Mantén 3 s para guardar — B cancela=3 Sekunden halten zum Speichern — B bricht ab
+Botones=Tasten
+Stick izquierdo=Linker Stick
+Stick derecho=Rechter Stick
+
+# --- Tastatur-Hinweise ---
+Teclado conectado=Tastatur verbunden
+Teclado desconectado=Tastatur getrennt
+Mapea botones en Ajustes > Teclado=Tasten unter Einstellungen > Tastatur belegen
+Los mapeos se conservan=Belegungen werden gespeichert
+
+# --- Belegungsziele ---
+Cruz=Kreuz
+Círculo=Kreis
+Cuadrado=Quadrat
+Triángulo=Dreieck
+D-pad Izquierda=D-Pad links
+D-pad Derecha=D-Pad rechts
+D-pad Arriba=D-Pad oben
+D-pad Abajo=D-Pad unten
+L1=L1
+R1=R1
+L3=L3
+R3=R3
+Opciones=Optionen
+Compartir=Teilen
+Touchpad=Touchpad
+PS=PS
+L2=L2
+R2=R2
+Stick izq. arriba=Linker Stick oben
+Stick izq. abajo=Linker Stick unten
+Stick izq. izquierda=Linker Stick links
+Stick izq. derecha=Linker Stick rechts
+Stick der. arriba=Rechter Stick oben
+Stick der. abajo=Rechter Stick unten
+Stick der. izquierda=Rechter Stick links
+Stick der. derecha=Rechter Stick rechts
+
+# --- Systemtastatur (swkbd) Hinweise ---
+IP de la consola (ej. 192.168.1.10)=IP der Konsole (z. B. 192.168.1.10)
+Tu ID publico de PSN (nombre de usuario)=Deine öffentliche PSN-ID (Online-ID)
+Account ID PSN en base64 (ej. wLEMeFoyimY==)=PSN-Account-ID in Base64 (z. B. wLEMeFoyimY==)
+PIN de 8 digitos mostrado en la PS4=8-stelliger PIN, der auf der PS4 angezeigt wird
+PIN de acceso configurado en la PS4=In der PS4 festgelegter Zugangs-PIN
