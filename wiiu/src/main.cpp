@@ -3320,7 +3320,7 @@ static void swkbd_shutdown()
 // Izq/Dcha la desliza (apply_console
 // vuelca IP+claves a los globals con los que conecta A).
 // ---------------------------------------------------------------------------
-#define APP_BUILD_TAG "gui-111"
+#define APP_BUILD_TAG "gui-112"
 
 // Chip de boton del gamepad: disco (mask en la mitad derecha del atlas)
 // + letra centrada. Colores robustos (gris medio + letra blanca): si en
@@ -4818,10 +4818,11 @@ static void draw_console_square(const MenuPal *p, int idx, float x, float y,
 	gui_image(art_x, art_y, art_w, art_h, su, sv, sw, sh, light);
 }
 
-// Panel de detalle de la consola elegida (gui-111): nombre grande,
-// direccion, estado con color, juego en curso y el chip A de
-// Conectar/Despertar abajo, a la altura del pie del cuadrado ("side" es
-// su lado).
+// Panel de detalle de la consola elegida (gui-112): nombre, estado
+// con color, juego en curso, la direccion IP al final en gris y el
+// chip A de Conectar/Despertar abajo, a la altura del pie del
+// cuadrado ("side" es su lado). El nombre va al mismo tamano que el
+// estado y con u*4 de ritmo entre lineas.
 static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 			       int pw, int side, int u, int scale, float k,
 			       bool sel, bool regist_now, bool seen,
@@ -4830,15 +4831,15 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 {
 	const ConfigConsole *con = &g_config.consoles[idx];
 
-	// Nombre (grande, acortado si no cabe) + direccion IP.
+	// Nombre (acortado si no cabe), al mismo tamano que el
+	// estado (gui-112): antes era un paso mas grande y la IP
+	// quedaba pegada arriba.
 	char nm[CONFIG_NAME_SIZE + 1];
 	snprintf(nm, sizeof(nm), "%s", con->name[0] ? con->name : "?");
-	int name_scale = scale + 2;
+	int name_scale = scale + 1;
 	while(nm[0] && gui_text_width(nm, name_scale) > pw)
 		nm[strlen(nm) - 1] = '\0';
 	gui_text(x, y, nm, col_fade(p->text, k), name_scale);
-	gui_text(x, y + (float)(u * 3), con->host, col_fade(p->text2, k),
-		 scale);
 
 	// Estado con color + juego en ejecucion (solo el discovery en
 	// READY trae running_app_name; el resto no tiene juego que
@@ -4870,8 +4871,12 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 		state_txt = tr("Sin datos");
 		state_col = p->text3;
 	}
-	float sy = y + (float)(u * 6);
+	float sy = y + (float)(u * 4);
 	gui_text(x, sy, state_txt, col_fade(state_col, k), scale + 1);
+	// Juego en curso (si la consola esta lista) y la IP
+	// debajo, en gris; con u*4 de ritmo y la IP siempre
+	// despues de la ultima linea visible.
+	float iy = sy + (float)(u * 3);
 	if(seen && state == CHIAKI_DISCOVERY_HOST_STATE_READY)
 	{
 		char line[96];
@@ -4881,9 +4886,10 @@ static void draw_console_panel(const MenuPal *p, int idx, float x, float y,
 			snprintf(line, sizeof(line), "%s", tr("Sin juego"));
 		while(line[0] && gui_text_width(line, scale) > pw)
 			line[strlen(line) - 1] = '\0';
-		gui_text(x, sy + (float)(u * 3), line,
-			 col_fade(p->text2, k), scale);
+		gui_text(x, iy, line, col_fade(p->text2, k), scale);
+		iy += (float)(u * 3);
 	}
+	gui_text(x, iy, con->host, col_fade(p->text3, k), scale);
 
 	// Accion de la consola (chip A en color acento) abajo a la
 	// izquierda del panel, a la altura del pie del cuadrado.
