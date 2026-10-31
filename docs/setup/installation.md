@@ -42,4 +42,4 @@
 
 === "MacOS/Windows/Linux Appimage Package"
 
-    1. Download the appopriate package from the [releases page](https://github.com/streetpea/chiaki-ng/releases){target="_blank" rel="noopener"} on GitHub (for macOS, use the Apple Silicon `-arm64` package; Intel `-amd64`/`-x86_64` packages are no longer built)
+    1. Download the appopriate package from the [releases page](https://github.com/chiaki-ng/chiaki-ng/releases){target="_blank" rel="noopener"} on GitHub (for macOS, use the Apple Silicon `-arm64` package; Intel `-amd64`/`-x86_64` packages are no longer built)
