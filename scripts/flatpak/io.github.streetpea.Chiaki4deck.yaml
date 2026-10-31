@@ -276,7 +276,7 @@ modules:
     builddir: true
     sources:
       - type: git
-        url: https://github.com/streetpea/chiaki-ng.git
+        url: https://github.com/chiaki-ng/chiaki-ng.git
         branch: main
     post-install:
       - install -Dm755 ../scripts/psn-account-id.py /app/bin/psn-account-id

@@ -7,10 +7,10 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>AGPL-3.0-only</project_license>
   <developer_name>Street Pea</developer_name>
-  <url type="homepage">https://streetpea.github.io/chiaki-ng</url>
+  <url type="homepage">https://chiaki-ng.github.io/chiaki-ng/</url>
   <url type="donation">https://buymeacoffee.com/streetpea</url>
-  <url type="help">https://streetpea.github.io/chiaki-ng/setup/</url>
-  <url type="bugtracker">https://github.com/streetpea/chiaki-ng/issues</url>
+  <url type="help">https://chiaki-ng.github.io/chiaki-ng/setup/</url>
+  <url type="bugtracker">https://github.com/chiaki-ng/chiaki-ng/issues</url>
   <url type="contact">https://discord.gg/tAMbRuwXDH</url>
   <description>
     <p>
@@ -19,7 +19,7 @@
   </description>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/streetpea/chiaki-ng/main/assets/screenshot.png</image>
+      <image>https://raw.githubusercontent.com/chiaki-ng/chiaki-ng/main/assets/screenshot.png</image>
     </screenshot>
   </screenshots>
   <update_contact>streetpea@proton.me</update_contact>
