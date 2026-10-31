@@ -88,7 +88,7 @@ jobs:
         token: "${{ secrets.RELEASE_PAT }}"
     - uses: sgpublic/delete-release-action@v1.2
       with:
-        repo: 'streetpea/chiaki-ng'
+        repo: ${{ github.repository }}
         release-drop: false
         pre-release-drop: true
         pre-release-keep-count: 1

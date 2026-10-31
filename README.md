@@ -1,4 +1,4 @@
-# [chiaki-ng](https://streetpea.github.io/chiaki-ng/) for Wii u (by MysticFlipFlop)
+# [chiaki-ng](https://chiaki-ng.github.io/chiaki-ng/) for Wii u (by MysticFlipFlop)
 
 <img width="100" height="100" alt="ppic" src="https://github.com/user-attachments/assets/dab711e4-2a5b-4183-8e0e-25528a574615" />
 
@@ -182,9 +182,6 @@ The compiled `.wuhb`/`.elf` binaries are output inside `build-wiiu/wiiu/`.
 - Based on **[chiaki-ng](https://github.com/chiaki-ng/chiaki-ng)** and the original **chiaki** by [thestr4ng3r](https://github.com/thestr4ng3r/chiaki) and contributors. Without them this port wouldn't exist.
 - **GNU AGPL v3** license — same as chiaki-ng; see [`COPYING`](COPYING) and [`LICENSES/`](LICENSES).
 - Dependencies with their own licenses: FFmpeg, Opus, nanopb, Jerasure, gf-complete, etc. (submodules and portlibs).
-
-
-
 
 ## Disclaimer
 This project is not endorsed or certified by Sony Interactive Entertainment LLC.
