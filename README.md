@@ -183,6 +183,16 @@ The compiled `.wuhb`/`.elf` binaries are output inside `build-wiiu/wiiu/`.
 - **GNU AGPL v3** license — same as chiaki-ng; see [`COPYING`](COPYING) and [`LICENSES/`](LICENSES).
 - Dependencies with their own licenses: FFmpeg, Opus, nanopb, Jerasure, gf-complete, etc. (submodules and portlibs).
 
+## Official downloads
+Only download chiaki-ng from these sources:
+
+- [GitHub Releases](https://github.com/chiaki-ng/chiaki-ng/releases)
+- [Flathub](https://flathub.org/apps/io.github.streetpea.Chiaki4deck)
+- winget: `winget install --id=StreetPea.chiaki-ng -e`
+- Homebrew: `brew install --cask streetpea/streetpea/chiaki-ng`
+
+Other websites offering chiaki-ng downloads, such as chiaki-ng.com, are not run by this project, and we can't vouch for the files they serve.
+
 ## Disclaimer
 This project is not endorsed or certified by Sony Interactive Entertainment LLC.
 

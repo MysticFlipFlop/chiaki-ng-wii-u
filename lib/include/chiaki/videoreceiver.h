@@ -40,6 +40,7 @@ typedef struct chiaki_video_receiver_t
 	// Frames vistos desde la ultima peticion de keyframe: si el IDR se
 	// pierde se repite la peticion (mantenimiento, ~60 frames ≈ 1 s).
 	unsigned int waiting_idr_frames;
+	uint64_t idr_request_last_ms; // when the IDR being waited for was last requested
 	ChiakiMutex frames_lost_mutex;
 } ChiakiVideoReceiver;
 
